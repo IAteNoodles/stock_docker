@@ -1,12 +1,7 @@
 """Data parser and database updater utilities.
 
-This module provides thin wrappers around database helpers to make it easy to
-update the PostgreSQL database with stock data records prepared elsewhere. It
-also includes a convenience function to upsert raw Marketstack-style items.
-
-Note: The main pipeline logic already lives in fetch_data.process_tickers, which
-ensures DB-first behavior and minimal API hits. This module exists to satisfy
-project requirements that call for a dedicated update_db.py component.
+Thin wrappers around the database layer to upsert prepared stock data rows.
+Intended for batch-style usage where records are already assembled.
 """
 from __future__ import annotations
 
@@ -15,9 +10,9 @@ import logging
 
 from .fetch_from_db import (
     connect_to_db,
-    create_stock_data_table,
     insert_stock_data,
 )
+from .db_schema import create_stock_data_table
 
 logger = logging.getLogger(__name__)
 

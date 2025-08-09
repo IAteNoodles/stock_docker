@@ -10,7 +10,7 @@ class TestAPI(unittest.TestCase):
     @patch("stock_pipeline.api.get_stock_data", return_value=[{"symbol": "ABC", "date": "2025-01-01", "open": 1.0, "high": 1.2, "low": 0.9, "close": 1.1, "volume": 1000}])
     def test_get_stocks_success(self, mock_get_stock_data, mock_process):
         client = TestClient(app)
-        resp = client.get("/stocks", params={"symbols": "ABC", "start_date": "2025-01-01", "end_date": "2025-01-02"})
+        resp = client.get("/stocks", params={"symbols": "ABC", "start_date": "2025-01-01", "end_date": "2025-01-02"}, headers={"X-Client-Id": "test-client"})
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
         self.assertIn("ABC", data)
@@ -20,7 +20,7 @@ class TestAPI(unittest.TestCase):
 
     def test_get_stocks_missing_params(self):
         client = TestClient(app)
-        resp = client.get("/stocks", params={"symbols": "ABC"})
+        resp = client.get("/stocks", params={"symbols": "ABC"}, headers={"X-Client-Id": "test-client"})
         self.assertEqual(resp.status_code, 400)
 
     def test_health(self):

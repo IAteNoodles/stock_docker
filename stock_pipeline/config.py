@@ -3,7 +3,13 @@
 This module provides a single place to read environment variables needed by the
 application: database credentials and API keys. It uses python-dotenv to load a
 `.env` file colocated with the package, and exposes simple accessors.
+
+Environment Variables
+- DB_NAME, DB_USER, DB_PASS/DB_PASSWORD, DB_HOST, DB_PORT
+- MARKETSTACK_API_KEYS: comma-separated keys (preferred)
+- MARKETSTACK_API_KEY: single key (legacy/fallback)
 """
+
 from __future__ import annotations
 
 import os
@@ -18,8 +24,17 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     """Return a sanitized environment variable value.
 
-    Trims whitespace, removes one pair of wrapping quotes if present, then
-    trims again. Returns default if the final result is empty.
+    Parameters
+    ----------
+    name : str
+        Variable name to read from the environment.
+    default : Optional[str]
+        Default value to use if the variable is missing or empty after sanitation.
+
+    Returns
+    -------
+    Optional[str]
+        Trimmed value with one level of wrapping quotes removed, or ``default``.
     """
     raw = os.getenv(name)
     if raw is None:
@@ -33,6 +48,7 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
 
 @dataclass(frozen=True)
 class DatabaseSettings:
+    """Typed container for database connection settings."""
     name: Optional[str]
     user: Optional[str]
     password: Optional[str]
@@ -41,7 +57,13 @@ class DatabaseSettings:
 
 
 def get_db_settings() -> DatabaseSettings:
-    """Return database settings from environment."""
+    """Return database settings from environment.
+
+    Returns
+    -------
+    DatabaseSettings
+        Dataclass with fields name, user, password, host, port (all optional strings).
+    """
     return DatabaseSettings(
         name=_env("DB_NAME"),
         user=_env("DB_USER"),
@@ -57,6 +79,12 @@ def get_marketstack_api_keys() -> List[str]:
     Supports either:
     - MARKETSTACK_API_KEYS: comma-separated string of keys
     - MARKETSTACK_API_KEY: single key (fallback)
+
+    Returns
+    -------
+    list[str]
+        Ordered list of API keys; duplicates removed with preference for the
+        explicit list when provided.
     """
     keys_csv = _env("MARKETSTACK_API_KEYS")
     keys: List[str] = []

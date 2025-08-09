@@ -1,17 +1,25 @@
-import os
 import psycopg2
 import logging
-import json
 from typing import Any, Dict, List, Optional
 
 from .config import get_db_settings
 import psycopg2.extras as extras
 
-"""Database helpers for stock data and fetch history.
+"""Database access helpers (data operations only).
 
-This module manages PostgreSQL connections, the stock_data table, and a history
-table used to track when a symbol was last attempted and the latest known data date.
-Also includes a 'latest' cache table for most recent EOD data per symbol.
+This module encapsulates PostgreSQL connectivity and data access/mutation
+operations for the stock pipeline. It intentionally excludes any schema
+creation concerns (moved to ``stock_pipeline.db_schema``) to keep a clear
+separation of responsibilities.
+
+Conventions
+- All functions assume required tables already exist.
+- Functions accept a live DB cursor when operating within a transaction
+  (for better batching and caller-controlled commits/rollbacks) or open
+  and close their own connections when necessary.
+- Timestamps returned by the DB are passed through (may be naive or
+  timezone-aware depending on the server configuration). Callers should
+  normalize to UTC as needed.
 """
 
 logger = logging.getLogger(__name__)
@@ -21,12 +29,18 @@ _DB = get_db_settings()
 
 
 def connect_to_db():
-    """Create and return a PostgreSQL connection.
+    """Open a new PostgreSQL connection.
 
     Returns
     -------
     psycopg2.extensions.connection | None
-        The connection object or None if connection fails.
+        A new connection if the operation succeeds, otherwise ``None``.
+
+    Notes
+    -----
+    - The caller is responsible for closing the connection.
+    - Connection parameters come from environment variables via
+      :func:`stock_pipeline.config.get_db_settings`.
     """
     try:
         conn = psycopg2.connect(
@@ -43,67 +57,21 @@ def connect_to_db():
         return None
 
 
-def create_stock_data_table(cursor) -> None:
-    """Ensure the stock_data table exists.
-
-    Parameters
-    ----------
-    cursor : psycopg2.extensions.cursor
-        Open DB cursor.
-    """
-    create_table_query = """
-    CREATE TABLE IF NOT EXISTS stock_data (
-        id SERIAL PRIMARY KEY,
-        symbol VARCHAR(50) NOT NULL,
-        trade_date DATE NOT NULL,
-        open_price NUMERIC(10, 4),
-        high_price NUMERIC(10, 4),
-        low_price NUMERIC(10, 4),
-        close_price NUMERIC(10, 4),
-        volume BIGINT,
-        UNIQUE (symbol, trade_date)
-    );
-    """
-    try:
-        cursor.execute(create_table_query)
-        logger.info("[db] ensured table stock_data")
-    except psycopg2.Error as e:
-        logger.error("[db] error creating table: %s", e)
-        
-
-# --- History table helpers ---
-
-def create_history_table(cursor) -> None:
-    """Ensure the history table exists.
-
-    Parameters
-    ----------
-    cursor : psycopg2.extensions.cursor
-        Open DB cursor.
-    """
-    query = """
-    CREATE TABLE IF NOT EXISTS history (
-        symbol VARCHAR(50) PRIMARY KEY,
-        latest_data_date DATE,
-        last_tried_to_fetch_date TIMESTAMPTZ
-    );
-    """
-    try:
-        cursor.execute(query)
-        logger.info("[db] ensured table history")
-    except psycopg2.Error as e:
-        logger.error("[db] error creating history table: %s", e)
-
+# --- History table data helpers ---
 
 def ensure_history_symbol(cursor, symbol: str) -> None:
-    """Ensure a history row exists for a symbol.
+    """Ensure a row exists for ``symbol`` in the history table.
 
     Parameters
     ----------
     cursor : psycopg2.extensions.cursor
-        Open DB cursor.
+        Open cursor bound to an active transaction.
     symbol : str
-        Stock symbol to ensure in history.
+        Stock ticker symbol (case-insensitive conventionally uppercased by callers).
+
+    Side Effects
+    ------------
+    Inserts a row if missing; no-op if the row already exists.
     """
     try:
         cursor.execute("INSERT INTO history(symbol) VALUES(%s) ON CONFLICT (symbol) DO NOTHING;", (symbol,))
@@ -113,19 +81,21 @@ def ensure_history_symbol(cursor, symbol: str) -> None:
 
 
 def get_history(cursor, symbol: str) -> Optional[Dict[str, Any]]:
-    """Get history entry for a symbol.
+    """Retrieve the history row for ``symbol``.
 
     Parameters
     ----------
     cursor : psycopg2.extensions.cursor
-        Open DB cursor.
+        Open cursor bound to an active transaction.
     symbol : str
-        Symbol to query.
+        Stock ticker symbol.
 
     Returns
     -------
     Optional[Dict[str, Any]]
-        Dict with latest_data_date and last_tried_to_fetch_date or None if not found.
+        Mapping with keys ``latest_data_date`` (date) and
+        ``last_tried_to_fetch_date`` (timestamp) if present; ``None`` if not found
+        or an error occurs.
     """
     try:
         cursor.execute("SELECT latest_data_date, last_tried_to_fetch_date FROM history WHERE symbol=%s;", (symbol,))
@@ -142,16 +112,17 @@ def get_history(cursor, symbol: str) -> Optional[Dict[str, Any]]:
 
 
 def update_history_latest_date(cursor, symbol: str, latest_date) -> None:
-    """Update the latest data date for a symbol in history.
+    """Set/advance ``history.latest_data_date`` for ``symbol``.
 
     Parameters
     ----------
     cursor : psycopg2.extensions.cursor
-        Open DB cursor.
+        Open cursor bound to an active transaction.
     symbol : str
-        Symbol to update.
+        Stock ticker symbol.
     latest_date : Any
-        New latest date value (str YYYY-MM-DD or date).
+        New latest date (string YYYY-MM-DD or date object). Existing value is
+        advanced using ``GREATEST`` to avoid moving backwards.
     """
     try:
         cursor.execute(
@@ -168,14 +139,14 @@ def update_history_latest_date(cursor, symbol: str, latest_date) -> None:
 
 
 def touch_history_last_tried(cursor, symbol: str) -> None:
-    """Set the last_tried_to_fetch_date for a symbol to NOW().
+    """Update ``history.last_tried_to_fetch_date`` to NOW() for ``symbol``.
 
     Parameters
     ----------
     cursor : psycopg2.extensions.cursor
-        Open DB cursor.
+        Open cursor bound to an active transaction.
     symbol : str
-        Symbol to touch.
+        Stock ticker symbol.
     """
     try:
         cursor.execute(
@@ -188,19 +159,19 @@ def touch_history_last_tried(cursor, symbol: str) -> None:
 
 
 def get_max_trade_date_for_symbol(cursor, symbol: str):
-    """Return the latest trade_date present in stock_data for a symbol.
+    """Return the maximum ``trade_date`` present in ``stock_data`` for ``symbol``.
 
     Parameters
     ----------
     cursor : psycopg2.extensions.cursor
-        Open DB cursor.
+        Open cursor bound to an active transaction.
     symbol : str
-        Symbol to query.
+        Stock ticker symbol.
 
     Returns
     -------
     date | None
-        Maximum trade_date or None.
+        The latest date if rows exist, otherwise ``None``.
     """
     try:
         cursor.execute("SELECT MAX(trade_date) FROM stock_data WHERE symbol=%s;", (symbol,))
@@ -212,17 +183,18 @@ def get_max_trade_date_for_symbol(cursor, symbol: str):
 
 
 def list_history_entries(cursor) -> List[Dict[str, Any]]:
-    """List all history entries.
+    """List all rows from the ``history`` table.
 
     Parameters
     ----------
     cursor : psycopg2.extensions.cursor
-        Open DB cursor.
+        Open cursor bound to an active transaction.
 
     Returns
     -------
     List[Dict[str, Any]]
-        Entries with symbol, latest_data_date, last_tried_to_fetch_date.
+        Each dict contains ``symbol``, ``latest_data_date``, and
+        ``last_tried_to_fetch_date``.
     """
     try:
         cursor.execute(
@@ -243,24 +215,27 @@ def list_history_entries(cursor) -> List[Dict[str, Any]]:
         return []
 
 
-# --- Existing stock data helpers ---
+# --- stock_data data helpers ---
 
 def insert_stock_data(cursor, symbol: Optional[str], stock_data: List[Dict[str, Any]]) -> None:
-    """Insert or upsert rows into stock_data with per-item validation.
+    """Upsert rows into ``stock_data`` with per-item validation.
 
     Parameters
     ----------
     cursor : psycopg2.extensions.cursor
-        Open DB cursor.
+        Open cursor bound to an active transaction.
     symbol : Optional[str]
-        Symbol to apply to all rows; if None, each item must include 'symbol'.
+        Default symbol to apply to all items. If ``None``, each item must
+        include a ``symbol`` field.
     stock_data : List[Dict[str, Any]]
-        Raw items (e.g., from API) containing price fields and date.
+        Raw item dicts (e.g., provider responses). Expected keys include
+        ``symbol``, ``date`` (or ``trade_date``), and price/volume fields.
 
-    Notes
-    -----
-    - If a row lacks a usable 'date' (or 'trade_date') or symbol, it's skipped and an error is logged.
-    - Missing numeric fields are inserted as NULLs instead of failing the batch.
+    Behavior
+    --------
+    - Rows missing symbol or date are skipped and logged.
+    - Numeric fields are inserted as NULL when missing.
+    - Conflicts on (symbol, trade_date) update existing values.
     """
     insert_query = """
     INSERT INTO stock_data (symbol, trade_date, open_price, high_price, low_price, close_price, volume)
@@ -298,7 +273,6 @@ def insert_stock_data(cursor, symbol: Optional[str], stock_data: List[Dict[str, 
                 cursor.execute(insert_query, (row_symbol, trade_date, open_price, high_price, low_price, close_price, volume))
                 count += 1
             except Exception as row_err:
-                # Log and skip this row; continue with others
                 logger.error("[db] insert row error: %s item=%s", row_err, item)
                 skipped += 1
         logger.info("[db] upsert symbol=%s count=%d skipped=%d", (symbol or 'per-row'), count, skipped)
@@ -307,12 +281,12 @@ def insert_stock_data(cursor, symbol: Optional[str], stock_data: List[Dict[str, 
 
 
 def get_stock_data(stock_symbol: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
-    """Retrieve stock data for a symbol and date range.
+    """Fetch rows from ``stock_data`` for a symbol over an inclusive date range.
 
     Parameters
     ----------
     stock_symbol : str
-        Symbol to query.
+        Stock ticker symbol to query.
     start_date : str
         Inclusive start date (YYYY-MM-DD).
     end_date : str
@@ -321,7 +295,8 @@ def get_stock_data(stock_symbol: str, start_date: str, end_date: str) -> List[Di
     Returns
     -------
     List[Dict[str, Any]]
-        Rows ordered by trade_date ascending.
+        Records sorted by ``trade_date`` ascending; price fields mapped to typical
+        names (open, high, low, close) and date formatted as YYYY-MM-DD.
     """
     query = """
     SELECT symbol, trade_date, open_price, high_price, low_price, close_price, volume
@@ -359,14 +334,14 @@ def get_stock_data(stock_symbol: str, start_date: str, end_date: str) -> List[Di
 
 
 def get_existing_dates(cursor, stock_symbol: str, start_date: str, end_date: str):
-    """Return a set of date strings present in DB for a symbol and range.
+    """Return a set of present dates for ``stock_symbol`` within a range.
 
     Parameters
     ----------
     cursor : psycopg2.extensions.cursor
-        Open DB cursor.
+        Open cursor bound to an active transaction.
     stock_symbol : str
-        Symbol to query.
+        Stock ticker symbol to query.
     start_date : str
         Inclusive start date (YYYY-MM-DD).
     end_date : str
@@ -375,7 +350,7 @@ def get_existing_dates(cursor, stock_symbol: str, start_date: str, end_date: str
     Returns
     -------
     set[str]
-        Set of YYYY-MM-DD dates.
+        Set of dates formatted as YYYY-MM-DD.
     """
     query = """
     SELECT trade_date FROM stock_data
@@ -388,69 +363,24 @@ def get_existing_dates(cursor, stock_symbol: str, start_date: str, end_date: str
     return s
 
 
-def add_symbol_to_history(symbol: str) -> bool:
-    """Ensure a symbol exists in history.
+# --- latest cache data helpers ---
+
+def get_latest_cache(cursor, symbol: str) -> Optional[Dict[str, Any]]:
+    """Read the latest cache row for ``symbol``.
 
     Parameters
     ----------
+    cursor : psycopg2.extensions.cursor
+        Open cursor bound to an active transaction.
     symbol : str
-        Symbol to ensure in history.
+        Stock ticker symbol.
 
     Returns
     -------
-    bool
-        True on success, False otherwise.
+    Optional[Dict[str, Any]]
+        Dict with keys ``symbol``, ``data`` (JSON), and ``last_updated`` (timestamp)
+        if present; otherwise ``None``.
     """
-    conn = connect_to_db()
-    if not conn:
-        return False
-    try:
-        with conn.cursor() as cursor:
-            create_history_table(cursor)
-            ensure_history_symbol(cursor, symbol)
-        conn.commit()
-        logger.info("[db] add_symbol_to_history done symbol=%s", symbol)
-        return True
-    except Exception as e:
-        logger.error("[db] add_symbol_to_history failed: %s", e)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return False
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def create_latest_table(cursor) -> None:
-    """Ensure the latest cache table exists.
-
-    Table schema:
-      latest(
-        symbol VARCHAR(50) PRIMARY KEY,
-        data JSONB,
-        last_updated TIMESTAMPTZ
-      )
-    """
-    query = """
-    CREATE TABLE IF NOT EXISTS latest (
-        symbol VARCHAR(50) PRIMARY KEY,
-        data JSONB,
-        last_updated TIMESTAMPTZ
-    );
-    """
-    try:
-        cursor.execute(query)
-        logger.info("[db] ensured table latest")
-    except psycopg2.Error as e:
-        logger.error("[db] error creating latest table: %s", e)
-
-
-def get_latest_cache(cursor, symbol: str) -> Optional[Dict[str, Any]]:
-    """Return latest cache row for a symbol: {symbol, data, last_updated} or None."""
     try:
         cursor.execute("SELECT symbol, data, last_updated FROM latest WHERE symbol=%s;", (symbol,))
         row = cursor.fetchone()
@@ -463,9 +393,18 @@ def get_latest_cache(cursor, symbol: str) -> Optional[Dict[str, Any]]:
 
 
 def upsert_latest_cache(cursor, symbol: str, data: Dict[str, Any], last_updated: Optional[str] = None) -> None:
-    """Upsert symbol into latest cache with JSON data and last_updated.
+    """Insert or update the latest cache for ``symbol``.
 
-    If last_updated is None, NOW() will be used.
+    Parameters
+    ----------
+    cursor : psycopg2.extensions.cursor
+        Open cursor bound to an active transaction.
+    symbol : str
+        Stock ticker symbol.
+    data : Dict[str, Any]
+        JSON-serializable payload to persist.
+    last_updated : Optional[str]
+        Optional timestamp (ISO string). If omitted, ``NOW()`` is used in the DB.
     """
     if last_updated is None:
         query = (
@@ -488,48 +427,19 @@ def upsert_latest_cache(cursor, symbol: str, data: Dict[str, Any], last_updated:
         logger.error("[db] error upserting latest cache: %s", e)
 
 
-# --- API key history helpers (store only index, never the key) ---
-
-def create_api_key_history_table(cursor) -> None:
-    """Ensure the api_key_history table exists with a unique idx column.
-
-    Handles legacy schemas by adding missing columns and a unique constraint on idx.
-    """
-    # Create table if missing (preferred schema)
-    try:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS api_key_history (
-                idx INT,
-                last_used TIMESTAMPTZ,
-                limit_reached TIMESTAMPTZ
-            );
-            """
-        )
-    except psycopg2.Error as e:
-        logger.error("[db] error ensuring api_key_history table exists: %s", e)
-
-    # Ensure required columns exist
-    try:
-        cursor.execute("ALTER TABLE api_key_history ADD COLUMN IF NOT EXISTS idx INT;")
-        cursor.execute("ALTER TABLE api_key_history ADD COLUMN IF NOT EXISTS last_used TIMESTAMPTZ;")
-        cursor.execute("ALTER TABLE api_key_history ADD COLUMN IF NOT EXISTS limit_reached TIMESTAMPTZ;")
-    except psycopg2.Error as e:
-        logger.error("[db] error ensuring api_key_history columns: %s", e)
-
-    # Ensure unique constraint or unique index on idx (so ON CONFLICT (idx) works)
-    try:
-        cursor.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS api_key_history_idx_uq ON api_key_history (idx);"
-        )
-    except psycopg2.Error as e:
-        logger.error("[db] error creating unique index on api_key_history.idx: %s", e)
-
-    logger.info("[db] ensured table api_key_history")
-
+# --- API key history data helpers (store only index, never the key) ---
 
 def upsert_api_keys_history(cursor, keys: List[str]) -> None:
-    """Ensure rows exist for indices of provided keys (0..len(keys)-1)."""
+    """Ensure rows exist for all API key indices.
+
+    Parameters
+    ----------
+    cursor : psycopg2.extensions.cursor
+        Open cursor bound to an active transaction.
+    keys : List[str]
+        In-memory list of API keys used at runtime. Only the indices are stored
+        in the database, keys themselves are never persisted.
+    """
     if not keys:
         return
     try:
@@ -548,10 +458,25 @@ def upsert_api_keys_history(cursor, keys: List[str]) -> None:
 
 
 def select_usable_api_key_idx(cursor, keys_count: int) -> Optional[int]:
-    """Select an index for a usable API key (limit not reached in last 30 days).
+    """Select a usable API key index using LRU preference.
 
-    Prefer least recently used (oldest last_used), then by idx. Updates last_used.
-    Returns the selected idx or None if none available.
+    Parameters
+    ----------
+    cursor : psycopg2.extensions.cursor
+        Open cursor bound to an active transaction.
+    keys_count : int
+        Number of keys available in memory.
+
+    Returns
+    -------
+    Optional[int]
+        Selected index or ``None`` if none are usable (e.g. all recently limited).
+
+    Notes
+    -----
+    - Prefers the key with the oldest ``last_used`` timestamp.
+    - Skips keys marked ``limit_reached`` within the last 30 days.
+    - Updates ``last_used`` for the selected index.
     """
     if not keys_count or keys_count <= 0:
         return None
@@ -583,7 +508,15 @@ def select_usable_api_key_idx(cursor, keys_count: int) -> Optional[int]:
 
 
 def mark_api_key_limit_reached_idx(cursor, idx: int) -> None:
-    """Mark a key index as having hit the rate limit now (429 observed)."""
+    """Mark ``idx`` as rate-limited (HTTP 429 observed) at ``NOW()``.
+
+    Parameters
+    ----------
+    cursor : psycopg2.extensions.cursor
+        Open cursor bound to an active transaction.
+    idx : int
+        Index of the API key in the runtime list.
+    """
     try:
         cursor.execute(
             "UPDATE api_key_history SET limit_reached = NOW() WHERE idx=%s;",
@@ -595,7 +528,18 @@ def mark_api_key_limit_reached_idx(cursor, idx: int) -> None:
 
 
 def list_api_key_history(cursor) -> List[Dict[str, Any]]:
-    """Return list of api_key_history rows: [{idx, last_used, limit_reached}]."""
+    """Return all API key index rows with usage metadata.
+
+    Parameters
+    ----------
+    cursor : psycopg2.extensions.cursor
+        Open cursor bound to an active transaction.
+
+    Returns
+    -------
+    List[Dict[str, Any]]
+        Dicts with ``idx``, ``last_used``, and ``limit_reached``.
+    """
     try:
         cursor.execute("SELECT idx, last_used, limit_reached FROM api_key_history ORDER BY idx;")
         rows = cursor.fetchall()
@@ -605,37 +549,22 @@ def list_api_key_history(cursor) -> List[Dict[str, Any]]:
         return []
 
 
-# --- Tracked symbols (special symbols refreshed every 24h) ---
-
-def create_tracked_symbols_table(cursor) -> None:
-    """Ensure the tracked_symbols table exists.
-
-    Schema:
-      tracked_symbols(
-        symbol VARCHAR(50) PRIMARY KEY,
-        tracked_at TIMESTAMPTZ DEFAULT NOW(),
-        last_fetched TIMESTAMPTZ
-      )
-    """
-    try:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tracked_symbols (
-                symbol VARCHAR(50) PRIMARY KEY,
-                tracked_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            """
-        )
-        # Ensure columns exist for forward-compat
-        cursor.execute("ALTER TABLE tracked_symbols ADD COLUMN IF NOT EXISTS tracked_at TIMESTAMPTZ DEFAULT NOW();")
-        cursor.execute("ALTER TABLE tracked_symbols ADD COLUMN IF NOT EXISTS last_fetched TIMESTAMPTZ;")
-        logger.info("[db] ensured table tracked_symbols")
-    except psycopg2.Error as e:
-        logger.error("[db] error creating tracked_symbols table: %s", e)
-
+# --- Tracked symbols data helpers ---
 
 def add_tracked_symbol(cursor, symbol: str) -> None:
-    """Add a symbol to tracked_symbols (idempotent)."""
+    """Add ``symbol`` to the ``tracked_symbols`` set.
+
+    Parameters
+    ----------
+    cursor : psycopg2.extensions.cursor
+        Open cursor bound to an active transaction.
+    symbol : str
+        Stock ticker symbol to track.
+
+    Notes
+    -----
+    Idempotent; existing rows are left unchanged.
+    """
     try:
         cursor.execute(
             """
@@ -651,7 +580,20 @@ def add_tracked_symbol(cursor, symbol: str) -> None:
 
 
 def remove_tracked_symbol(cursor, symbol: str) -> bool:
-    """Remove a symbol from tracked_symbols. Returns True if removed."""
+    """Remove ``symbol`` from ``tracked_symbols``.
+
+    Parameters
+    ----------
+    cursor : psycopg2.extensions.cursor
+        Open cursor bound to an active transaction.
+    symbol : str
+        Stock ticker symbol to untrack.
+
+    Returns
+    -------
+    bool
+        ``True`` if a row was deleted; ``False`` otherwise.
+    """
     try:
         cursor.execute("DELETE FROM tracked_symbols WHERE symbol=%s;", (symbol,))
         removed = cursor.rowcount > 0
@@ -662,18 +604,19 @@ def remove_tracked_symbol(cursor, symbol: str) -> bool:
         return False
 
 
-def is_tracked_symbol(cursor, symbol: str) -> bool:
-    """Return True if the symbol is currently tracked."""
-    try:
-        cursor.execute("SELECT 1 FROM tracked_symbols WHERE symbol=%s;", (symbol,))
-        return cursor.fetchone() is not None
-    except psycopg2.Error as e:
-        logger.error("[db] error checking tracked symbol: %s", e)
-        return False
-
-
 def list_tracked_symbols(cursor) -> List[str]:
-    """List all tracked symbols."""
+    """List all tracked symbols.
+
+    Parameters
+    ----------
+    cursor : psycopg2.extensions.cursor
+        Open cursor bound to an active transaction.
+
+    Returns
+    -------
+    List[str]
+        Sorted list of tracked ticker symbols.
+    """
     try:
         cursor.execute("SELECT symbol FROM tracked_symbols ORDER BY symbol;")
         return [r[0] for r in cursor.fetchall()]
@@ -683,7 +626,18 @@ def list_tracked_symbols(cursor) -> List[str]:
 
 
 def list_tracked_symbols_with_meta(cursor) -> List[Dict[str, Any]]:
-    """List tracked symbols with metadata (last_fetched)."""
+    """List tracked symbols with metadata.
+
+    Parameters
+    ----------
+    cursor : psycopg2.extensions.cursor
+        Open cursor bound to an active transaction.
+
+    Returns
+    -------
+    List[Dict[str, Any]]
+        Dicts with ``symbol`` and ``last_fetched`` timestamp for each tracked row.
+    """
     try:
         cursor.execute("SELECT symbol, last_fetched FROM tracked_symbols ORDER BY symbol;")
         rows = cursor.fetchall()
@@ -693,19 +647,18 @@ def list_tracked_symbols_with_meta(cursor) -> List[Dict[str, Any]]:
         return []
 
 
-def get_tracked_symbol_last_fetched(cursor, symbol: str) -> Optional[str]:
-    """Return last_fetched for a tracked symbol (or None)."""
-    try:
-        cursor.execute("SELECT last_fetched FROM tracked_symbols WHERE symbol=%s;", (symbol,))
-        row = cursor.fetchone()
-        return row[0] if row else None
-    except psycopg2.Error as e:
-        logger.error("[db] error reading last_fetched for %s: %s", symbol, e)
-        return None
-
-
 def set_tracked_last_fetched(cursor, symbol: str, when: Optional[str] = None) -> None:
-    """Update last_fetched for a tracked symbol to NOW() or a provided timestamp."""
+    """Update ``tracked_symbols.last_fetched`` for ``symbol``.
+
+    Parameters
+    ----------
+    cursor : psycopg2.extensions.cursor
+        Open cursor bound to an active transaction.
+    symbol : str
+        Stock ticker symbol.
+    when : Optional[str]
+        Optional timestamp to set explicitly; when omitted, ``NOW()`` is used.
+    """
     try:
         if when is None:
             cursor.execute("UPDATE tracked_symbols SET last_fetched = NOW() WHERE symbol=%s;", (symbol,))

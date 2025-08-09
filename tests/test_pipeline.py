@@ -12,6 +12,11 @@ from stock_pipeline.fetch_data import (
     _range_within_last_1000,
     get_latest_value,
 )
+from stock_pipeline.db_schema import (
+    create_stock_data_table,
+    create_history_table,
+)
+from stock_pipeline.fetch_from_db import connect_to_db, insert_stock_data
 
 
 class TestPipeline(unittest.TestCase):
@@ -65,8 +70,6 @@ class TestPipeline(unittest.TestCase):
 
     def test_insert_stock_data_skips_incomplete(self):
         """insert_stock_data should skip rows missing symbol/date and not raise."""
-        from stock_pipeline.fetch_from_db import connect_to_db, create_stock_data_table, insert_stock_data
-
         conn = connect_to_db()
         if conn is None:
             self.skipTest("PostgreSQL not available; skipping DB-dependent test")
@@ -86,7 +89,6 @@ class TestPipeline(unittest.TestCase):
     @patch("stock_pipeline.fetch_data.fetch_historical_data_marketstack")
     def test_process_tickers_db_first(self, mock_fetch):
         """process_tickers must not call API when data present in DB for range."""
-        from stock_pipeline.fetch_from_db import connect_to_db, create_stock_data_table, insert_stock_data
         conn = connect_to_db()
         if conn is None:
             self.skipTest("PostgreSQL not available; skipping DB-dependent test")
@@ -111,7 +113,7 @@ class TestPipeline(unittest.TestCase):
     def test_history_crud_and_cooldown(self):
         """Create history row, update fields, and verify cooldown prevents immediate fetch."""
         from stock_pipeline.fetch_from_db import (
-            connect_to_db, create_stock_data_table, create_history_table, ensure_history_symbol,
+            ensure_history_symbol,
             get_history, update_history_latest_date, touch_history_last_tried, list_history_entries,
         )
         conn = connect_to_db()
@@ -137,7 +139,7 @@ class TestPipeline(unittest.TestCase):
             conn.close()
 
     def test_get_stock_data_and_existing_dates(self):
-        from stock_pipeline.fetch_from_db import connect_to_db, create_stock_data_table, insert_stock_data, get_existing_dates, get_stock_data
+        from stock_pipeline.fetch_from_db import get_existing_dates, get_stock_data
         conn = connect_to_db()
         if conn is None:
             self.skipTest("PostgreSQL not available; skipping DB-dependent test")

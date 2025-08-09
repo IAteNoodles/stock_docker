@@ -1,3 +1,21 @@
+"""Fetcher and orchestration logic for the stock pipeline.
+
+Responsibilities
+- Provider accessors for Marketstack v2 endpoints (/eod and /eod/latest) with
+  API-key rotation and robust error handling.
+- Orchestration to ensure DB-first behavior and enforce a 24h cooldown based on
+  the history table (process_tickers).
+- Latest cache helper that prefers cached values within a 24h TTL
+  (get_or_refresh_latest).
+- Background workers for periodic refreshes based on cooldown and tracked
+  symbols (get_latest_value, run_tracked_refresher).
+
+Notes
+- Network calls are kept minimal and polite (small sleeps). Tests mock requests.
+- API keys are selected by index and persisted only as indices; actual keys are
+  never stored in the DB.
+"""
+
 import os
 import requests
 import json
@@ -9,31 +27,31 @@ import threading
 from .config import _env, get_marketstack_api_keys
 from .fetch_from_db import (
     connect_to_db,
-    create_stock_data_table,
     insert_stock_data,
     get_stock_data,
     get_existing_dates,
-    create_history_table,
     ensure_history_symbol,
     get_history,
     update_history_latest_date,
     touch_history_last_tried,
     get_max_trade_date_for_symbol,
     list_history_entries,
-    create_latest_table,
     get_latest_cache,
     upsert_latest_cache,
-    create_api_key_history_table,
     upsert_api_keys_history,
     select_usable_api_key_idx,
     mark_api_key_limit_reached_idx,
-    add_symbol_to_history,
-    create_tracked_symbols_table,
     add_tracked_symbol,
     remove_tracked_symbol,
-    is_tracked_symbol,
     list_tracked_symbols_with_meta,
     set_tracked_last_fetched,
+)
+from .db_schema import (
+    create_stock_data_table,
+    create_history_table,
+    create_latest_table,
+    create_api_key_history_table,
+    create_tracked_symbols_table,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,6 +62,16 @@ _selected_api_key_idx: int | None = None  # in-process cached selected key index
 
 def _select_api_key_index_once(keys: list[str]) -> int | None:
     """Select and cache an API key index via DB once; fallback to 0.
+
+    Parameters
+    ----------
+    keys : list[str]
+        In-memory list of API keys. Only the selected index is recorded to DB.
+
+    Returns
+    -------
+    Optional[int]
+        Selected index; ``0`` is used as a safe fallback when DB selection fails.
 
     Called at first use or when the previously selected key hits rate limit.
     """
@@ -73,6 +101,18 @@ def _select_api_key_index_once(keys: list[str]) -> int | None:
 
 
 def _mark_selected_key_limited(keys: list[str]) -> None:
+    """Mark the currently selected API key index as rate-limited.
+
+    Parameters
+    ----------
+    keys : list[str]
+        In-memory list of API keys; if empty or no selection exists, this is a no-op.
+
+    Side Effects
+    ------------
+    Updates ``api_key_history.limit_reached`` for the selected index and clears
+    the in-process cache so the next call reselects a new key.
+    """
     global _selected_api_key_idx
     if _selected_api_key_idx is None or not keys:
         return
@@ -97,7 +137,18 @@ def _mark_selected_key_limited(keys: list[str]) -> None:
 
 
 def _current_api_key(keys: list[str]) -> str | None:
-    """Return the currently selected API key, selecting once if needed."""
+    """Return the currently selected API key, selecting once if needed.
+
+    Parameters
+    ----------
+    keys : list[str]
+        In-memory list of API keys.
+
+    Returns
+    -------
+    Optional[str]
+        The selected API key string or ``None`` if no keys are available.
+    """
     global _selected_api_key_idx
     if not keys:
         return None
@@ -108,30 +159,6 @@ def _current_api_key(keys: list[str]) -> str | None:
     if _selected_api_key_idx < 0 or _selected_api_key_idx >= len(keys):
         _selected_api_key_idx = 0
     return keys[_selected_api_key_idx]
-
-
-def _rotate_keys_on_429(request_fn, keys: list[str]):
-    """Call request_fn(key) trying each key; if 429 status, rotate to next key.
-
-    Returns (response_obj, used_key) or (None, None) if all keys exhausted.
-    request_fn should return a tuple (response, status_code) and raise no exceptions.
-    """
-    if not keys:
-        return None, None
-    key_index = 0
-    tried = 0
-    while tried < len(keys):
-        key = keys[key_index]
-        resp, status = request_fn(key)
-        if status == 429:
-            logger.warning("[api] 429 rate limit for key index=%d; rotating", key_index)
-            key_index = (key_index + 1) % len(keys)
-            tried += 1
-            # brief pause to avoid hammering
-            time.sleep(0.2)
-            continue
-        return resp, key
-    return None, None
 
 
 def fetch_historical_data_marketstack(tickers, start_date, end_date):
