@@ -118,6 +118,8 @@ def _mark_selected_key_limited(keys: list[str]) -> None:
         return
     conn = connect_to_db()
     if not conn:
+        # Clear local cache even if DB is unavailable to force reselect.
+        _selected_api_key_idx = None
         return
     try:
         with conn.cursor() as cursor:
@@ -134,6 +136,8 @@ def _mark_selected_key_limited(keys: list[str]) -> None:
             conn.close()
         except Exception:
             pass
+        # Always clear selection so next call reselects.
+        _selected_api_key_idx = None
 
 
 def _current_api_key(keys: list[str]) -> str | None:
@@ -168,6 +172,8 @@ def fetch_historical_data_marketstack(tickers, start_date, end_date):
     Uses one logical request per ticker (with pagination up to page_size=1000),
     and rotates API keys on HTTP 429.
     """
+    # Normalize tickers (trim and uppercase) and drop empties
+    tickers = [t.strip().upper() for t in (tickers or []) if isinstance(t, str) and t.strip()]
     keys = get_marketstack_api_keys()
     if not keys:
         logger.warning("MARKETSTACK_API_KEY(S) not found. Proceeding with dummy key for test/mocked runs.")
@@ -217,8 +223,7 @@ def fetch_historical_data_marketstack(tickers, start_date, end_date):
             if status == 429:
                 logger.warning("[api-fetch] 429 for current key; marking limited and reselecting")
                 _mark_selected_key_limited(keys)
-                # force reselect on next loop
-                _selected_api_key_idx = None
+                # slight backoff before next attempt with a different key
                 time.sleep(0.2)
                 continue
 
@@ -277,6 +282,8 @@ def fetch_latest_data_marketstack(tickers):
 
     Returns a dict mapping symbol -> latest item dict (or None).
     """
+    # Normalize tickers (trim and uppercase) and drop empties
+    tickers = [t.strip().upper() for t in (tickers or []) if isinstance(t, str) and t.strip()]
     keys = get_marketstack_api_keys()
     if not keys:
         logger.warning("MARKETSTACK_API_KEY(S) not found. Proceeding with dummy key for test/mocked runs.")
@@ -310,8 +317,8 @@ def fetch_latest_data_marketstack(tickers):
         if status == 429:
             logger.warning("[api-latest] 429 for current key; marking limited and reselecting")
             _mark_selected_key_limited(keys)
-            _selected_api_key_idx = None
-            # try once with newly selected key
+            # try once with newly selected key after slight backoff
+            time.sleep(0.2)
             api_key2 = _current_api_key(keys)
             if api_key2 is not None and api_key2 != api_key:
                 resp, status = do_request_with_key(api_key2)
@@ -369,6 +376,9 @@ def _dates_set(start_date: str, end_date: str) -> set[str]:
     """
     s = datetime.strptime(start_date, "%Y-%m-%d").date()
     e = datetime.strptime(end_date, "%Y-%m-%d").date()
+    # Handle inverted ranges by swapping
+    if s > e:
+        s, e = e, s
     days = (e - s).days
     return {(s + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days + 1)}
 
@@ -409,6 +419,8 @@ def process_tickers(tickers, start_date, end_date):
     IMPORTANT: Do not split requests into per-day API calls. If fetching is needed,
     perform only one logical fetch per ticker (broad window when applicable).
     """
+    # Normalize tickers (trim and uppercase) and drop empties
+    tickers = [t.strip().upper() for t in (tickers or []) if isinstance(t, str) and t.strip()]
     logger.info("[process] start=%s end=%s tickers=%s", start_date, end_date, tickers)
 
     succeeded, failed = set(), set()
@@ -679,6 +691,12 @@ def get_latest_value(stop_event: 'threading.Event | None' = None, default_idle_s
                                         latest_date = (item.get("date") or item.get("trade_date") or "")[:10]
                                         if latest_date:
                                             update_history_latest_date(cursor, sym, latest_date)
+                                        # Also refresh the latest cache so subsequent reads are cache hits
+                                        try:
+                                            upsert_latest_cache(cursor, sym, item)
+                                        except Exception:
+                                            # Non-fatal if cache update fails
+                                            pass
                                     c2.commit()
                                 finally:
                                     try:

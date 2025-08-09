@@ -17,9 +17,11 @@ from pydantic import BaseModel
 import time
 import logging
 import sys
-from datetime import datetime, timezone
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+import asyncio
 
 from .fetch_from_db import (
     get_stock_data,
@@ -139,6 +141,33 @@ class StockQueryResponse(BaseModel):
     volume: int | None
 
 
+# Global executor for background tasks
+background_executor = ThreadPoolExecutor(max_workers=8)
+_in_progress_refreshes = set()
+_in_progress_lock = threading.Lock()
+
+def schedule_refresh(symbol: str):
+    sym = symbol.strip().upper()
+    if not sym:
+        return
+    with _in_progress_lock:
+        if sym in _in_progress_refreshes:
+            return
+        _in_progress_refreshes.add(sym)
+    def refresh_task():
+        try:
+            get_or_refresh_latest(sym)
+        finally:
+            with _in_progress_lock:
+                _in_progress_refreshes.discard(sym)
+    background_executor.submit(refresh_task)
+
+
+async def run_in_thread(func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
+
 @app.get("/stocks", response_model=Dict[str, List[StockQueryResponse]])
 async def get_stocks(
     request: Request,
@@ -152,6 +181,7 @@ async def get_stocks(
     ----------
     symbols : str
         Comma-separated list of tickers.
+        
     start_date, end_date : str
         Inclusive YYYY-MM-DD dates.
     """
@@ -173,15 +203,16 @@ async def get_stocks(
     # Ensure data exists (fetch only if missing)
     try:
         logger.info("[api] calling process_tickers() to ensure data...")
-        _succeeded, _failed = process_tickers(syms, s_date, e_date)
+        _succeeded, _failed = await run_in_thread(process_tickers, syms, s_date, e_date)
         logger.info("[api] process_tickers done succeeded=%s failed=%s", sorted(list(_succeeded)), sorted(list(_failed)))
     except Exception as e:
         logger.exception("[api] ensure/process error: %s", e)
 
     result: Dict[str, List[dict]] = {}
     for sym in syms:
-        rows = get_stock_data(sym, s_date, e_date)
-        logger.info("[api] DB rows for %s: %d", sym, len(rows))
+        rows = await run_in_thread(get_stock_data, sym, s_date, e_date)
+        if not rows:
+            schedule_refresh(sym)
         result[sym] = rows  # empty list if none
     logger.info("[api] total_duration_sec=%.3f", (time.time()-t0))
     logger.info("[api] GET /stocks end cid=%s duration=%.3fs symbols=%d", cid, (time.time()-t0), len(syms))
@@ -214,31 +245,31 @@ async def get_latest(
     sym = symbol.strip().upper()
     if not sym:
         raise HTTPException(status_code=400, detail="Invalid symbol")
-
-    # Cache-first: return cached if last_updated < 24h
-    conn = connect_to_db()
+    conn = await run_in_thread(connect_to_db)
     cache: Optional[dict] = None
     last_upd = None
     if conn:
         try:
-            with conn.cursor() as cursor:
-                create_latest_table(cursor)
-                row = get_latest_cache(cursor, sym)
-                if row:
-                    cache = row.get("data")
-                    last_upd = row.get("last_updated")
-            conn.commit()
+            def get_cache():
+                with conn.cursor() as cursor:
+                    create_latest_table(cursor)
+                    row = get_latest_cache(cursor, sym)
+                    if row:
+                        return row.get("data"), row.get("last_updated")
+                conn.commit()
+                return None, None
+            cache, last_upd = await run_in_thread(get_cache)
         except Exception:
             try:
-                conn.rollback()
+                await run_in_thread(conn.rollback)
             except Exception:
                 pass
         finally:
             try:
-                conn.close()
+                await run_in_thread(conn.close)
             except Exception:
                 pass
-
+    age_sec = None
     if last_upd is not None:
         if getattr(last_upd, "tzinfo", None) is None:
             last_upd = last_upd.replace(tzinfo=timezone.utc)
@@ -246,48 +277,9 @@ async def get_latest(
         if age_sec < 86400:
             logger.info("[api] GET /latest cache-hit cid=%s symbol=%s age=%.1fs duration=%.3fs", cid, sym, age_sec, (time.time()-t0))
             return {"symbol": sym, "data": cache, "cached": True}
-
-    # Stale or no cache: fetch from provider and upsert
-    try:
-        latest_map = fetch_latest_data_marketstack([sym])
-        item = (latest_map or {}).get(sym)
-    except Exception as e:
-        logger.error("[api] latest fetch error for %s: %s", sym, e)
-        item = None
-
-    if item is None:
-        # nothing from provider; return (stale) cache if present
-        logger.info("[api] GET /latest provider-miss cid=%s symbol=%s used_cache=%s duration=%.3fs", request.headers.get("X-Client-Id") or (getattr(request.client, 'host', None) or 'unknown'), sym, bool(cache), (time.time()-t0))
-        return {"symbol": sym, "data": cache, "cached": bool(cache)}
-
-    # Upsert into DB (stock_data/history/latest cache)
-    conn = connect_to_db()
-    if not conn:
-        logger.info("[api] GET /latest no-db cid=%s symbol=%s duration=%.3fs", cid, sym, (time.time()-t0))
-        return {"symbol": sym, "data": item, "cached": False}
-    try:
-        with conn.cursor() as cursor:
-            create_stock_data_table(cursor)
-            insert_stock_data(cursor, sym, [item])
-            latest_date = (item.get("date") or item.get("trade_date") or "")[:10]
-            if latest_date:
-                update_history_latest_date(cursor, sym, latest_date)
-            create_latest_table(cursor)
-            upsert_latest_cache(cursor, sym, item)
-        conn.commit()
-    except Exception as e:
-        logger.error("[api] latest DB upsert error for %s: %s", sym, e)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-    logger.info("[api] GET /latest provider-hit cid=%s symbol=%s duration=%.3fs", request.headers.get("X-Client-Id") or (getattr(request.client, 'host', None) or 'unknown'), sym, (time.time()-t0))
-    return {"symbol": sym, "data": item, "cached": False}
+    schedule_refresh(sym)
+    logger.info("[api] GET /latest scheduled background refresh for %s", sym)
+    return {"symbol": sym, "data": cache, "cached": bool(cache)}
 
 
 @app.get("/api-key-history")
@@ -297,27 +289,30 @@ async def get_api_key_history(request: Request):
     cid = _get_client_id(request)
     logger.info("[api] GET /api-key-history start cid=%s", cid)
     keys = get_marketstack_api_keys()
-    conn = connect_to_db()
+    conn = await run_in_thread(connect_to_db)
     if not conn:
         logger.error("[api] GET /api-key-history DB unavailable cid=%s", cid)
         raise HTTPException(status_code=500, detail="DB unavailable")
     try:
-        with conn.cursor() as cursor:
-            create_api_key_history_table(cursor)
-            upsert_api_keys_history(cursor, keys)
-            rows = list_api_key_history(cursor)
-        conn.commit()
+        def get_history():
+            with conn.cursor() as cursor:
+                create_api_key_history_table(cursor)
+                upsert_api_keys_history(cursor, keys)
+                rows = list_api_key_history(cursor)
+            conn.commit()
+            return rows
+        rows = await run_in_thread(get_history)
         logger.info("[api] GET /api-key-history end cid=%s duration=%.3fs keys=%d rows=%d", cid, (time.time()-t0), len(keys), len(rows))
         return {"count": len(keys), "history": rows}
     except Exception as e:
         try:
-            conn.rollback()
+            await run_in_thread(conn.rollback)
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"Error reading api_key_history: {e}")
     finally:
         try:
-            conn.close()
+            await run_in_thread(conn.close)
         except Exception:
             pass
 
@@ -331,14 +326,12 @@ async def track(request: Request, symbol: str = Query(..., description="Symbol t
     sym = symbol.strip().upper()
     if not sym:
         raise HTTPException(status_code=400, detail="Invalid symbol")
-    ok = track_symbol(sym)
+    ok = await run_in_thread(track_symbol, sym)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to track symbol")
-    # Optionally refresh immediately (respects cooldown)
-    data = refresh_tracked_symbol(sym)
-    logger.info("[api] POST /track end cid=%s symbol=%s fetched=%s duration=%.3fs", cid, sym, bool(data), (time.time()-t0))
-    # last_fetched is already updated inside refresh_tracked_symbol when it fetches
-    return {"symbol": sym, "tracked": True, "data": data}
+    schedule_refresh(sym)
+    logger.info("[api] POST /track scheduled background refresh for %s", sym)
+    return {"symbol": sym, "tracked": True}
 
 
 @app.post("/untrack")
@@ -350,28 +343,29 @@ async def untrack(request: Request, symbol: str = Query(..., description="Symbol
     sym = symbol.strip().upper()
     if not sym:
         raise HTTPException(status_code=400, detail="Invalid symbol")
-    conn = connect_to_db()
+    conn = await run_in_thread(connect_to_db)
     current = False
     if conn:
         try:
-            with conn.cursor() as cursor:
-                create_tracked_symbols_table(cursor)
-                current = sym in list_tracked_symbols(cursor)
-            conn.commit()
+            def check_tracked():
+                with conn.cursor() as cursor:
+                    create_tracked_symbols_table(cursor)
+                    return sym in list_tracked_symbols(cursor)
+                conn.commit()
+            current = await run_in_thread(check_tracked)
         except Exception:
             try:
-                conn.rollback()
+                await run_in_thread(conn.rollback)
             except Exception:
                 pass
         finally:
             try:
-                conn.close()
+                await run_in_thread(conn.close)
             except Exception:
                 pass
-    removed = untrack_symbol(sym)
+    removed = await run_in_thread(untrack_symbol, sym)
     logger.info("[api] POST /untrack end cid=%s symbol=%s removed=%s was_tracked=%s duration=%.3fs", cid, sym, bool(removed), bool(current), (time.time()-t0))
     if not removed and not current:
-        # was not tracked; treat as success (idempotent)
         return {"symbol": sym, "tracked": False, "removed": False}
     return {"symbol": sym, "tracked": False, "removed": bool(removed)}
 
@@ -385,30 +379,33 @@ async def track_status(request: Request, symbol: str = Query(..., description="T
     sym = symbol.strip().upper()
     if not sym:
         raise HTTPException(status_code=400, detail="Invalid symbol")
-    conn = connect_to_db()
+    conn = await run_in_thread(connect_to_db)
     cached = False
     data = None
     if conn:
         try:
-            with conn.cursor() as cursor:
-                create_tracked_symbols_table(cursor)
-                row = next((r for r in list_tracked_symbols_with_meta(cursor) if r["symbol"] == sym), None)
-                if row:
-                    data = row.get("last_fetched")
-                    if data is not None and getattr(data, "tzinfo", None) is None:
-                        data = data.replace(tzinfo=timezone.utc)
-                    now_utc = datetime.now(timezone.utc)
-                    delta = 86400 - (now_utc - data).total_seconds() if data else 0
-                    cached = delta > 0
-            conn.commit()
+            def get_status():
+                with conn.cursor() as cursor:
+                    create_tracked_symbols_table(cursor)
+                    row = next((r for r in list_tracked_symbols_with_meta(cursor) if r["symbol"] == sym), None)
+                    if row:
+                        d = row.get("last_fetched")
+                        if d is not None and getattr(d, "tzinfo", None) is None:
+                            d = d.replace(tzinfo=timezone.utc)
+                        now_utc = datetime.now(timezone.utc)
+                        delta = 86400 - (now_utc - d).total_seconds() if d else 0
+                        return d, delta > 0
+                conn.commit()
+                return None, False
+            data, cached = await run_in_thread(get_status)
         except Exception:
             try:
-                conn.rollback()
+                await run_in_thread(conn.rollback)
             except Exception:
                 pass
         finally:
             try:
-                conn.close()
+                await run_in_thread(conn.close)
             except Exception:
                 pass
     logger.info("[api] GET /track/status end cid=%s symbol=%s cached_or_cooldown=%s duration=%.3fs", cid, sym, cached, (time.time()-t0))
@@ -420,40 +417,42 @@ async def track_list(request: Request):
     """List all tracked symbols with last_fetched and next due time in seconds."""
     t0 = time.time()
     logger.info("[api] GET /track/list start cid=%s", request.headers.get("X-Client-Id") or (getattr(request.client, 'host', None) or 'unknown'))
-    conn = connect_to_db()
+    conn = await run_in_thread(connect_to_db)
     if not conn:
         logger.info("[api] GET /track/list no-db duration=%.3fs", (time.time()-t0))
         return {"tracked": []}
     try:
-        with conn.cursor() as cursor:
-            create_tracked_symbols_table(cursor)
-            rows = list_tracked_symbols_with_meta(cursor)
-        conn.commit()
-        # compute next_due for each row
-        out = []
-        now_utc = datetime.now(timezone.utc)
-        for r in rows:
-            lf = r.get("last_fetched")
-            if lf is not None and getattr(lf, "tzinfo", None) is None:
-                lf = lf.replace(tzinfo=timezone.utc)
-            if lf is None:
-                next_due = "now"
-                seconds = 0
-            else:
-                delta = 86400 - (now_utc - lf).total_seconds()
-                seconds = int(delta) if delta > 0 else 0
-                next_due = seconds
-            out.append({"symbol": r["symbol"], "last_fetched": r.get("last_fetched"), "seconds_until_next_fetch": next_due})
+        def get_list():
+            with conn.cursor() as cursor:
+                create_tracked_symbols_table(cursor)
+                rows = list_tracked_symbols_with_meta(cursor)
+            conn.commit()
+            out = []
+            now_utc = datetime.now(timezone.utc)
+            for r in rows:
+                lf = r.get("last_fetched")
+                if lf is not None and getattr(lf, "tzinfo", None) is None:
+                    lf = lf.replace(tzinfo=timezone.utc)
+                if lf is None:
+                    next_due = "now"
+                    seconds = 0
+                else:
+                    delta = 86400 - (now_utc - lf).total_seconds()
+                    seconds = int(delta) if delta > 0 else 0
+                    next_due = seconds
+                out.append({"symbol": r["symbol"], "last_fetched": r.get("last_fetched"), "seconds_until_next_fetch": next_due})
+            return out
+        out = await run_in_thread(get_list)
         logger.info("[api] GET /track/list end cid=%s duration=%.3fs count=%d", request.headers.get("X-Client-Id") or (getattr(request.client, 'host', None) or 'unknown'), (time.time()-t0), len(out))
         return {"tracked": out}
     except Exception as e:
         try:
-            conn.rollback()
+            await run_in_thread(conn.rollback)
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"Error listing tracked symbols: {e}")
     finally:
         try:
-            conn.close()
+            await run_in_thread(conn.close)
         except Exception:
             pass

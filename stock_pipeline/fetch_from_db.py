@@ -494,7 +494,22 @@ def select_usable_api_key_idx(cursor, keys_count: int) -> Optional[int]:
         )
         row = cursor.fetchone()
         if not row:
-            return None
+            # Fallback: all keys may be recently limited. Choose the least-recently limited
+            # to make forward progress (better than returning None and failing hard).
+            cursor.execute(
+                """
+                SELECT idx
+                FROM api_key_history
+                WHERE idx >= 0 AND idx < %s
+                ORDER BY COALESCE(limit_reached, TIMESTAMP '1970-01-01'),
+                         COALESCE(last_used, TIMESTAMP '1970-01-01'), idx
+                LIMIT 1;
+                """,
+                (keys_count,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
         idx = row[0]
         cursor.execute(
             "UPDATE api_key_history SET last_used = NOW() WHERE idx=%s;",
