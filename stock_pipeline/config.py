@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 from dotenv import load_dotenv
 
 # Load .env next to this file so it works regardless of CWD
@@ -51,6 +51,22 @@ def get_db_settings() -> DatabaseSettings:
     )
 
 
-def get_marketstack_api_key() -> Optional[str]:
-    """Return the Marketstack API key from environment (or None)."""
-    return _env("MARKETSTACK_API_KEY")
+def get_marketstack_api_keys() -> List[str]:
+    """Return a list of Marketstack API keys from env.
+
+    Supports either:
+    - MARKETSTACK_API_KEYS: comma-separated string of keys
+    - MARKETSTACK_API_KEY: single key (fallback)
+    """
+    keys_csv = _env("MARKETSTACK_API_KEYS")
+    keys: List[str] = []
+    if keys_csv:
+        keys = [k.strip() for k in keys_csv.split(",") if k and k.strip()]
+    single = _env("MARKETSTACK_API_KEY")
+    if single:
+        # ensure first key is the legacy single key if no list provided
+        if not keys:
+            keys = [single]
+        elif single not in keys:
+            keys.insert(0, single)
+    return keys

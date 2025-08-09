@@ -1,54 +1,23 @@
 import os
 import psycopg2
-from dotenv import load_dotenv
 import logging
+import json
 from typing import Any, Dict, List, Optional
+
+from .config import get_db_settings
+import psycopg2.extras as extras
 
 """Database helpers for stock data and fetch history.
 
 This module manages PostgreSQL connections, the stock_data table, and a history
 table used to track when a symbol was last attempted and the latest known data date.
+Also includes a 'latest' cache table for most recent EOD data per symbol.
 """
-
-# Load environment variables from the .env next to this file
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 logger = logging.getLogger(__name__)
 
-
-def _env(name: str, default: Optional[str] = None) -> Optional[str]:
-    """Return a sanitized environment variable value.
-
-    Parameters
-    ----------
-    name : str
-        Name of the environment variable.
-    default : Optional[str]
-        Default value to return if not present.
-
-    Returns
-    -------
-    Optional[str]
-        Trimmed value or the default if not set.
-    """
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    # First trim outer whitespace
-    v = raw.strip()
-    # Remove a single pair of wrapping quotes if present
-    if (len(v) >= 2) and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
-        v = v[1:-1]
-    # Trim again to remove inner padding that was inside quotes
-    v = v.strip()
-    return v if v != "" else default
-
-# Get database connection details from environment variables
-DB_NAME = _env("DB_NAME")
-DB_USER = _env("DB_USER")
-DB_PASS = _env("DB_PASS")
-DB_HOST = _env("DB_HOST")
-DB_PORT = _env("DB_PORT")
+# Centralized DB settings
+_DB = get_db_settings()
 
 
 def connect_to_db():
@@ -61,11 +30,11 @@ def connect_to_db():
     """
     try:
         conn = psycopg2.connect(
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASS,
-            host=DB_HOST,
-            port=DB_PORT
+            dbname=_DB.name,
+            user=_DB.user,
+            password=_DB.password,
+            host=_DB.host,
+            port=_DB.port,
         )
         logger.info("[db] connected to PostgreSQL")
         return conn
@@ -454,3 +423,294 @@ def add_symbol_to_history(symbol: str) -> bool:
             conn.close()
         except Exception:
             pass
+
+
+def create_latest_table(cursor) -> None:
+    """Ensure the latest cache table exists.
+
+    Table schema:
+      latest(
+        symbol VARCHAR(50) PRIMARY KEY,
+        data JSONB,
+        last_updated TIMESTAMPTZ
+      )
+    """
+    query = """
+    CREATE TABLE IF NOT EXISTS latest (
+        symbol VARCHAR(50) PRIMARY KEY,
+        data JSONB,
+        last_updated TIMESTAMPTZ
+    );
+    """
+    try:
+        cursor.execute(query)
+        logger.info("[db] ensured table latest")
+    except psycopg2.Error as e:
+        logger.error("[db] error creating latest table: %s", e)
+
+
+def get_latest_cache(cursor, symbol: str) -> Optional[Dict[str, Any]]:
+    """Return latest cache row for a symbol: {symbol, data, last_updated} or None."""
+    try:
+        cursor.execute("SELECT symbol, data, last_updated FROM latest WHERE symbol=%s;", (symbol,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {"symbol": row[0], "data": row[1], "last_updated": row[2]}
+    except psycopg2.Error as e:
+        logger.error("[db] error reading latest cache: %s", e)
+        return None
+
+
+def upsert_latest_cache(cursor, symbol: str, data: Dict[str, Any], last_updated: Optional[str] = None) -> None:
+    """Upsert symbol into latest cache with JSON data and last_updated.
+
+    If last_updated is None, NOW() will be used.
+    """
+    if last_updated is None:
+        query = (
+            "INSERT INTO latest(symbol, data, last_updated) "
+            "VALUES(%s, %s, NOW()) "
+            "ON CONFLICT (symbol) DO UPDATE SET data=EXCLUDED.data, last_updated=NOW();"
+        )
+        params = (symbol, extras.Json(data))
+    else:
+        query = (
+            "INSERT INTO latest(symbol, data, last_updated) "
+            "VALUES(%s, %s, %s) "
+            "ON CONFLICT (symbol) DO UPDATE SET data=EXCLUDED.data, last_updated=EXCLUDED.last_updated;"
+        )
+        params = (symbol, extras.Json(data), last_updated)
+    try:
+        cursor.execute(query, params)
+        logger.info("[db] latest cache upserted symbol=%s", symbol)
+    except psycopg2.Error as e:
+        logger.error("[db] error upserting latest cache: %s", e)
+
+
+# --- API key history helpers (store only index, never the key) ---
+
+def create_api_key_history_table(cursor) -> None:
+    """Ensure the api_key_history table exists with a unique idx column.
+
+    Handles legacy schemas by adding missing columns and a unique constraint on idx.
+    """
+    # Create table if missing (preferred schema)
+    try:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_key_history (
+                idx INT,
+                last_used TIMESTAMPTZ,
+                limit_reached TIMESTAMPTZ
+            );
+            """
+        )
+    except psycopg2.Error as e:
+        logger.error("[db] error ensuring api_key_history table exists: %s", e)
+
+    # Ensure required columns exist
+    try:
+        cursor.execute("ALTER TABLE api_key_history ADD COLUMN IF NOT EXISTS idx INT;")
+        cursor.execute("ALTER TABLE api_key_history ADD COLUMN IF NOT EXISTS last_used TIMESTAMPTZ;")
+        cursor.execute("ALTER TABLE api_key_history ADD COLUMN IF NOT EXISTS limit_reached TIMESTAMPTZ;")
+    except psycopg2.Error as e:
+        logger.error("[db] error ensuring api_key_history columns: %s", e)
+
+    # Ensure unique constraint or unique index on idx (so ON CONFLICT (idx) works)
+    try:
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS api_key_history_idx_uq ON api_key_history (idx);"
+        )
+    except psycopg2.Error as e:
+        logger.error("[db] error creating unique index on api_key_history.idx: %s", e)
+
+    logger.info("[db] ensured table api_key_history")
+
+
+def upsert_api_keys_history(cursor, keys: List[str]) -> None:
+    """Ensure rows exist for indices of provided keys (0..len(keys)-1)."""
+    if not keys:
+        return
+    try:
+        for i in range(len(keys)):
+            cursor.execute(
+                """
+                INSERT INTO api_key_history(idx)
+                VALUES(%s)
+                ON CONFLICT (idx) DO NOTHING;
+                """,
+                (i,),
+            )
+        logger.info("[db] api_key_history ensured rows for %d indices", len(keys))
+    except psycopg2.Error as e:
+        logger.error("[db] error upserting api_key_history indices: %s", e)
+
+
+def select_usable_api_key_idx(cursor, keys_count: int) -> Optional[int]:
+    """Select an index for a usable API key (limit not reached in last 30 days).
+
+    Prefer least recently used (oldest last_used), then by idx. Updates last_used.
+    Returns the selected idx or None if none available.
+    """
+    if not keys_count or keys_count <= 0:
+        return None
+    try:
+        cursor.execute(
+            """
+            SELECT idx
+            FROM api_key_history
+            WHERE idx >= 0 AND idx < %s
+              AND (limit_reached IS NULL OR limit_reached < NOW() - INTERVAL '30 days')
+            ORDER BY COALESCE(last_used, TIMESTAMP '1970-01-01'), idx
+            LIMIT 1;
+            """,
+            (keys_count,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        idx = row[0]
+        cursor.execute(
+            "UPDATE api_key_history SET last_used = NOW() WHERE idx=%s;",
+            (idx,),
+        )
+        logger.info("[db] selected api key idx=%s", idx)
+        return idx
+    except psycopg2.Error as e:
+        logger.error("[db] error selecting usable api key idx: %s", e)
+        return None
+
+
+def mark_api_key_limit_reached_idx(cursor, idx: int) -> None:
+    """Mark a key index as having hit the rate limit now (429 observed)."""
+    try:
+        cursor.execute(
+            "UPDATE api_key_history SET limit_reached = NOW() WHERE idx=%s;",
+            (idx,),
+        )
+        logger.info("[db] api key idx=%s marked limit_reached", idx)
+    except psycopg2.Error as e:
+        logger.error("[db] error marking api key idx limit_reached: %s", e)
+
+
+def list_api_key_history(cursor) -> List[Dict[str, Any]]:
+    """Return list of api_key_history rows: [{idx, last_used, limit_reached}]."""
+    try:
+        cursor.execute("SELECT idx, last_used, limit_reached FROM api_key_history ORDER BY idx;")
+        rows = cursor.fetchall()
+        return [{"idx": r[0], "last_used": r[1], "limit_reached": r[2]} for r in rows]
+    except psycopg2.Error as e:
+        logger.error("[db] error listing api_key_history: %s", e)
+        return []
+
+
+# --- Tracked symbols (special symbols refreshed every 24h) ---
+
+def create_tracked_symbols_table(cursor) -> None:
+    """Ensure the tracked_symbols table exists.
+
+    Schema:
+      tracked_symbols(
+        symbol VARCHAR(50) PRIMARY KEY,
+        tracked_at TIMESTAMPTZ DEFAULT NOW(),
+        last_fetched TIMESTAMPTZ
+      )
+    """
+    try:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracked_symbols (
+                symbol VARCHAR(50) PRIMARY KEY,
+                tracked_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        # Ensure columns exist for forward-compat
+        cursor.execute("ALTER TABLE tracked_symbols ADD COLUMN IF NOT EXISTS tracked_at TIMESTAMPTZ DEFAULT NOW();")
+        cursor.execute("ALTER TABLE tracked_symbols ADD COLUMN IF NOT EXISTS last_fetched TIMESTAMPTZ;")
+        logger.info("[db] ensured table tracked_symbols")
+    except psycopg2.Error as e:
+        logger.error("[db] error creating tracked_symbols table: %s", e)
+
+
+def add_tracked_symbol(cursor, symbol: str) -> None:
+    """Add a symbol to tracked_symbols (idempotent)."""
+    try:
+        cursor.execute(
+            """
+            INSERT INTO tracked_symbols(symbol, tracked_at)
+            VALUES(%s, NOW())
+            ON CONFLICT (symbol) DO UPDATE SET tracked_at = tracked_symbols.tracked_at;
+            """,
+            (symbol,),
+        )
+        logger.info("[db] tracked_symbols add symbol=%s", symbol)
+    except psycopg2.Error as e:
+        logger.error("[db] error adding tracked symbol: %s", e)
+
+
+def remove_tracked_symbol(cursor, symbol: str) -> bool:
+    """Remove a symbol from tracked_symbols. Returns True if removed."""
+    try:
+        cursor.execute("DELETE FROM tracked_symbols WHERE symbol=%s;", (symbol,))
+        removed = cursor.rowcount > 0
+        logger.info("[db] tracked_symbols remove symbol=%s removed=%s", symbol, removed)
+        return removed
+    except psycopg2.Error as e:
+        logger.error("[db] error removing tracked symbol: %s", e)
+        return False
+
+
+def is_tracked_symbol(cursor, symbol: str) -> bool:
+    """Return True if the symbol is currently tracked."""
+    try:
+        cursor.execute("SELECT 1 FROM tracked_symbols WHERE symbol=%s;", (symbol,))
+        return cursor.fetchone() is not None
+    except psycopg2.Error as e:
+        logger.error("[db] error checking tracked symbol: %s", e)
+        return False
+
+
+def list_tracked_symbols(cursor) -> List[str]:
+    """List all tracked symbols."""
+    try:
+        cursor.execute("SELECT symbol FROM tracked_symbols ORDER BY symbol;")
+        return [r[0] for r in cursor.fetchall()]
+    except psycopg2.Error as e:
+        logger.error("[db] error listing tracked symbols: %s", e)
+        return []
+
+
+def list_tracked_symbols_with_meta(cursor) -> List[Dict[str, Any]]:
+    """List tracked symbols with metadata (last_fetched)."""
+    try:
+        cursor.execute("SELECT symbol, last_fetched FROM tracked_symbols ORDER BY symbol;")
+        rows = cursor.fetchall()
+        return [{"symbol": r[0], "last_fetched": r[1]} for r in rows]
+    except psycopg2.Error as e:
+        logger.error("[db] error listing tracked symbols meta: %s", e)
+        return []
+
+
+def get_tracked_symbol_last_fetched(cursor, symbol: str) -> Optional[str]:
+    """Return last_fetched for a tracked symbol (or None)."""
+    try:
+        cursor.execute("SELECT last_fetched FROM tracked_symbols WHERE symbol=%s;", (symbol,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+    except psycopg2.Error as e:
+        logger.error("[db] error reading last_fetched for %s: %s", symbol, e)
+        return None
+
+
+def set_tracked_last_fetched(cursor, symbol: str, when: Optional[str] = None) -> None:
+    """Update last_fetched for a tracked symbol to NOW() or a provided timestamp."""
+    try:
+        if when is None:
+            cursor.execute("UPDATE tracked_symbols SET last_fetched = NOW() WHERE symbol=%s;", (symbol,))
+        else:
+            cursor.execute("UPDATE tracked_symbols SET last_fetched = %s WHERE symbol=%s;", (when, symbol))
+        logger.info("[db] tracked_symbols last_fetched updated symbol=%s", symbol)
+    except psycopg2.Error as e:
+        logger.error("[db] error updating tracked last_fetched: %s", e)

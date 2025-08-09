@@ -96,6 +96,9 @@ class TestPipeline(unittest.TestCase):
                 insert_stock_data(cursor, None, [{
                     "symbol": "MOCK2", "date": "2025-02-01T00:00:00+0000",
                     "open": 2, "high": 2, "low": 2, "close": 2, "volume": 20
+                }, {
+                    "symbol": "MOCK2", "date": "2025-02-02T00:00:00+0000",
+                    "open": 2, "high": 2, "low": 2, "close": 2, "volume": 22
                 }])
             conn.commit()
         finally:
@@ -158,11 +161,15 @@ class TestPipeline(unittest.TestCase):
     # ---- Background worker test (no DB, full mocks) ----
 
     @patch("stock_pipeline.fetch_data.time.sleep", return_value=None)
-    @patch("stock_pipeline.fetch_data.process_tickers")
+    @patch("stock_pipeline.fetch_data.fetch_latest_data_marketstack", return_value={"DUE1": {"symbol": "DUE1", "date": "2025-08-01T00:00:00+0000", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 10}})
+    @patch("stock_pipeline.fetch_data.update_history_latest_date")
+    @patch("stock_pipeline.fetch_data.insert_stock_data")
+    @patch("stock_pipeline.fetch_data.create_stock_data_table")
     @patch("stock_pipeline.fetch_data.list_history_entries")
     @patch("stock_pipeline.fetch_data.create_history_table")
+    @patch("stock_pipeline.fetch_data.touch_history_last_tried")
     @patch("stock_pipeline.fetch_data.connect_to_db")
-    def test_background_worker_due_symbol(self, mock_conn, mock_create_tbl, mock_list, mock_process, _mock_sleep):
+    def test_background_worker_due_symbol(self, mock_conn, mock_touch, mock_create_tbl_hist, mock_list, mock_create_tbl_data, mock_insert, mock_update_hist, mock_latest, _mock_sleep):
         class DummyCursor:
             def __enter__(self):
                 return self
@@ -187,14 +194,16 @@ class TestPipeline(unittest.TestCase):
         mock_list.side_effect = list_side_effect
 
         stop_event = MagicMock()
-        # stop_event.wait returns False on first no-entries sleep(0), then True to exit
         def wait_side_effect(timeout):
             return True  # cause immediate exit when called
         stop_event.wait.side_effect = wait_side_effect
 
         # Run a single iteration path
         get_latest_value(stop_event=stop_event, default_idle_seconds=0)
-        mock_process.assert_called_with(["DUE1"], unittest.mock.ANY, unittest.mock.ANY)
+        mock_touch.assert_called_with(unittest.mock.ANY, "DUE1")
+        mock_latest.assert_called_with(["DUE1"])
+        mock_insert.assert_called()
+        mock_update_hist.assert_called()
 
 
 if __name__ == "__main__":
