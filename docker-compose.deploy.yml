@@ -21,7 +21,7 @@ services:
       dockerfile: Dockerfile.git
       args:
         GIT_REPO: ${GIT_REPO}
-        GIT_REF: ${GIT_REF:-main}
+        GIT_REF: ${GIT_REF:-master}
     entrypoint: ["/bin/sh", "-lc"]
     command:
       [
@@ -51,7 +51,7 @@ services:
       dockerfile: Dockerfile.git
       args:
         GIT_REPO: ${GIT_REPO}
-        GIT_REF: ${GIT_REF:-main}
+        GIT_REF: ${GIT_REF:-master}
     command:
       [
         "uvicorn",

@@ -1,112 +1,212 @@
 @echo off
 setlocal enabledelayedexpansion
 
-REM Usage:
-REM   deploy.bat up         - build and start services
-REM   deploy.bat down       - stop services
-REM   deploy.bat restart    - restart services
-REM   deploy.bat logs [svc] - tail logs (optionally service)
-REM   deploy.bat status     - show status
-REM   deploy.bat init       - prompt and (re)write .env.deploy
+REM Windows deployment script mirroring deploy.sh behavior
+REM - Path-independent (resolves files relative to this script)
+REM - Uses docker compose v2
+REM - Builds with/without cache
+REM - Waits for Postgres, creates DB if missing, applies minimal schema
+REM - Logs, status, restart, init
 
-set COMPOSE_FILE=docker-compose.deploy.yml
-set ENV_FILE=.env.deploy
+REM Resolve absolute paths
+set "SCRIPT_DIR=%~dp0"
+for %%I in ("%SCRIPT_DIR%") do set "SCRIPT_DIR=%%~fI"
+set "COMPOSE_FILE=%SCRIPT_DIR%docker-compose.deploy.yml"
+set "ENV_FILE=%SCRIPT_DIR%.env.deploy"
 
-REM Default repo info
-set GIT_REPO=https://github.com/IAteNoodles/stock_docker.git
-set GIT_REF=master
+REM Ensure docker and compose are available
+where docker >nul 2>&1 || (echo Error: docker not found in PATH & exit /b 1)
+docker compose version >nul 2>&1 || (echo Error: docker compose plugin not available (need Docker Compose v2) & exit /b 1)
 
-REM Helper: prompt for a variable
-set PROMPT_DB_NAME=Postgres DB name [stocks_db]:
-set PROMPT_DB_USER=Postgres DB user [stock_user]:
-set PROMPT_DB_PASS=Postgres DB password [stock_pass]:
-set PROMPT_API_KEYS=Marketstack API keys (comma-separated):
+REM Helpers -----------------------------------------------------------------
 
-REM Write .env.deploy
+:read_db_name
+set "DB_NAME="
+if exist "%ENV_FILE%" (
+  for /f "usebackq tokens=1,* delims==" %%A in ("%ENV_FILE%") do (
+    if /I "%%A"=="DB_NAME" set "DB_NAME=%%B"
+  )
+)
+REM Trim surrounding quotes/spaces
+if defined DB_NAME (
+  set "DB_NAME=!DB_NAME: =!"
+  if "!DB_NAME:~0,1!"=="\"" set "DB_NAME=!DB_NAME:~1!"
+  if "!DB_NAME:~-1!"=="\"" set "DB_NAME=!DB_NAME:~0,-1!"
+)
+exit /b 0
+
+:db_wait_ready
+REM Wait for Postgres service to be ready
+docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" exec -T postgres sh -lc "set -e; U=\"${POSTGRES_USER:-postgres}\"; until pg_isready -h 127.0.0.1 -p 5432 -q -U \"$U\" -d postgres; do sleep 1; done" >nul 2>&1
+exit /b 0
+
+:db_create_if_missing
+call :read_db_name
+if not defined DB_NAME (
+  echo [deploy] Warning: DB_NAME not set in %ENV_FILE%; skipping DB creation
+  exit /b 0
+)
+docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" exec -T postgres sh -lc "set -e; U=\"${POSTGRES_USER:-postgres}\"; EXISTS=\$(psql -U \"$U\" -d postgres -Atqc \"SELECT 1 FROM pg_database WHERE datname='!DB_NAME!';\"); if [ \"$EXISTS\" != \"1\" ]; then echo [deploy] creating database !DB_NAME!; psql -U \"$U\" -d postgres -v ON_ERROR_STOP=1 -c \"CREATE DATABASE \\\"!DB_NAME!\\\";\"; else echo [deploy] database !DB_NAME! already exists; fi" || echo [deploy] create-if-missing step skipped/failed
+exit /b 0
+
+:db_apply_schema
+call :read_db_name
+if not defined DB_NAME exit /b 0
+REM Apply minimal schema (history, latest)
+docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" exec -T postgres sh -lc "set -e; U=\"${POSTGRES_USER:-postgres}\"; psql -U \"$U\" -d \"!DB_NAME!\" -v ON_ERROR_STOP=1 -c \"CREATE TABLE IF NOT EXISTS history (symbol TEXT PRIMARY KEY, latest_data_date DATE);\"; psql -U \"$U\" -d \"!DB_NAME!\" -v ON_ERROR_STOP=1 -c \"CREATE TABLE IF NOT EXISTS latest (symbol TEXT PRIMARY KEY, data JSONB NOT NULL, last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW());\"" || echo [deploy] schema step skipped/failed
+exit /b 0
+
+:ensure_db_exists
+call :db_wait_ready
+call :db_create_if_missing
+call :db_apply_schema
+exit /b 0
+
+REM Prompt helpers -----------------------------------------------------------
+
+:prompt_var
+set "_PROMPT_VAR_NAME=%~1"
+set "_PROMPT_MSG=%~2"
+set "_PROMPT_DEF=%~3"
+set "_PROMPT_VAL="
+if defined _PROMPT_DEF (
+  set /p _PROMPT_VAL=%_PROMPT_MSG% [%_PROMPT_DEF%]: 
+  if not defined _PROMPT_VAL set "_PROMPT_VAL=%_PROMPT_DEF%"
+) else (
+  set /p _PROMPT_VAL=%_PROMPT_MSG%: 
+)
+set "%_PROMPT_VAR_NAME%=%_PROMPT_VAL%"
+exit /b 0
+
 :write_env
 echo.
 echo Configuring %ENV_FILE%...
-set /p DB_NAME=%PROMPT_DB_NAME%
-if "!DB_NAME!"=="" set DB_NAME=stocks_db
-set /p DB_USER=%PROMPT_DB_USER%
-if "!DB_USER!"=="" set DB_USER=stock_user
-set /p DB_PASS=%PROMPT_DB_PASS%
-if "!DB_PASS!"=="" set DB_PASS=stock_pass
-set /p MARKETSTACK_API_KEYS=%PROMPT_API_KEYS%
-
+set "DB_NAME="
+set "DB_USER="
+set "DB_PASS="
+set "MARKETSTACK_API_KEYS="
+set "GIT_REPO="
+set "GIT_REF="
+call :prompt_var DB_NAME "Postgres DB name" "stocks_db"
+call :prompt_var DB_USER "Postgres DB user" "stock_user"
+call :prompt_var DB_PASS "Postgres DB password" "stock_pass"
+call :prompt_var MARKETSTACK_API_KEYS "Marketstack API keys (comma-separated)" ""
+call :prompt_var GIT_REPO "App Git repo (URL, used by Dockerfile.git)" "https://github.com/IAteNoodles/stock_docker.git"
+call :prompt_var GIT_REF "App Git ref (branch/tag/commit)" "master"
 (
-    echo # Generated by deploy.bat on %DATE% %TIME%
-    echo DB_NAME=!DB_NAME!
-    echo DB_USER=!DB_USER!
-    echo DB_PASS=!DB_PASS!
-    echo.
-    echo # Comma-separated API keys for Marketstack
-    echo MARKETSTACK_API_KEYS=!MARKETSTACK_API_KEYS!
-    echo.
-    echo # Repo and ref for the application cloned during image build
-    echo GIT_REPO=%GIT_REPO%
-    echo GIT_REF=%GIT_REF%
-) > %ENV_FILE%
+  echo # Generated by deploy.bat on %DATE% %TIME%
+  echo DB_NAME=%DB_NAME%
+  echo DB_USER=%DB_USER%
+  echo DB_PASS=%DB_PASS%
+  echo.
+  echo # Comma-separated API keys for Marketstack
+  echo MARKETSTACK_API_KEYS=%MARKETSTACK_API_KEYS%
+  echo.
+  echo # Repo and ref for the application cloned during image build
+  echo GIT_REPO=%GIT_REPO%
+  echo GIT_REF=%GIT_REF%
+) > "%ENV_FILE%"
 echo Wrote %ENV_FILE%
-goto:eof
+exit /b 0
 
-REM Compose commands
+REM Commands ----------------------------------------------------------------
+
 :up
-if not exist %ENV_FILE% call :write_env
+if not exist "%COMPOSE_FILE%" (
+  echo Error: compose file not found: %COMPOSE_FILE%
+  exit /b 1
+)
+if not exist "%ENV_FILE%" call :write_env
+set "NO_CACHE=%~2"
 echo Bringing up stack...
-docker compose --env-file %ENV_FILE% -f %COMPOSE_FILE% up -d --build
+if /I "%NO_CACHE%"=="--no-cache" (
+  docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" build --no-cache || exit /b 1
+  docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" up -d || exit /b 1
+) else (
+  docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" up -d --build || exit /b 1
+)
+call :ensure_db_exists
 echo Services started. Dagster UI: http://localhost:33000  API: http://localhost:8000  Postgres: localhost:65432
-goto:eof
+exit /b 0
 
 :down
-docker compose --env-file %ENV_FILE% -f %COMPOSE_FILE% down
-goto:eof
+docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" down
+exit /b 0
 
 :restart
-docker compose --env-file %ENV_FILE% -f %COMPOSE_FILE% down
-docker compose --env-file %ENV_FILE% -f %COMPOSE_FILE% up -d --build
-goto:eof
+if not exist "%COMPOSE_FILE%" (
+  echo Error: compose file not found: %COMPOSE_FILE%
+  exit /b 1
+)
+set "NO_CACHE=%~2"
+docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" down
+if /I "%NO_CACHE%"=="--no-cache" (
+  docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" build --no-cache || exit /b 1
+  docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" up -d || exit /b 1
+) else (
+  docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" up -d --build || exit /b 1
+)
+call :ensure_db_exists
+exit /b 0
 
 :logs
-if "%2"=="" (
-    docker compose --env-file %ENV_FILE% -f %COMPOSE_FILE% logs -f --tail=200
+set "SVC=%~2"
+if defined SVC (
+  docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" logs -f --tail=200 "%SVC%"
 ) else (
-    docker compose --env-file %ENV_FILE% -f %COMPOSE_FILE% logs -f --tail=200 %2
+  docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" logs -f --tail=200
 )
-goto:eof
+exit /b 0
 
 :status
-docker compose --env-file %ENV_FILE% -f %COMPOSE_FILE% ps
-goto:eof
+docker compose -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" ps
+exit /b 0
 
 :init
 call :write_env
-goto:eof
+exit /b 0
 
-REM Main dispatch
-if "%1"=="up"      goto up
-if "%1"=="down"    goto down
-if "%1"=="restart" goto restart
-if "%1"=="logs"    goto logs
-if "%1"=="status"  goto status
-if "%1"=="init"    goto init
+REM Main dispatch / Interactive --------------------------------------------
+if /I "%~1"=="up"       goto up
+if /I "%~1"=="down"     goto down
+if /I "%~1"=="restart"  goto restart
+if /I "%~1"=="logs"     goto logs
+if /I "%~1"=="status"   goto status
+if /I "%~1"=="init"     goto init
 
-REM Interactive wizard
+REM Wizard
 echo Deploy wizard
-echo 1) Init (.env.deploy)
-echo 2) Up
-echo 3) Down
-echo 4) Logs
-echo 5) Status
-echo 6) Restart
-echo 0) Exit
+echo 1^) Init (.env.deploy)
+echo 2^) Up
+echo 3^) Down
+echo 4^) Logs
+echo 5^) Status
+echo 6^) Restart
+echo 0^) Exit
 :menu
-set /p CHOICE=Select option:
+set /p CHOICE=Select option: 
 if "%CHOICE%"=="1" call :write_env
-if "%CHOICE%"=="2" goto up
-if "%CHOICE%"=="3" goto down
-if "%CHOICE%"=="4" goto logs
-if "%CHOICE%"=="5" goto status
-if "%CHOICE%"=="6" goto restart
-if "%CHOICE%"=="0" exit /b
+if "%CHOICE%"=="2" (
+  set "ANS=" & set /p ANS=Rebuild without cache? [y/N]: 
+  if /I "!ANS!"=="y" (
+    call :up _ --no-cache
+  ) else (
+    call :up _
+  )
+)
+if "%CHOICE%"=="3" call :down
+if "%CHOICE%"=="4" (
+  set "SVC=" & set /p SVC=Service (blank=all): 
+  call :logs _ !SVC!
+)
+if "%CHOICE%"=="5" call :status
+if "%CHOICE%"=="6" (
+  set "ANS=" & set /p ANS=Rebuild without cache? [y/N]: 
+  if /I "!ANS!"=="y" (
+    call :restart _ --no-cache
+  ) else (
+    call :restart _
+  )
+)
+if "%CHOICE%"=="0" exit /b 0
 goto menu

@@ -2,7 +2,7 @@
 # Usage (fish):
 #   docker build \
 #     --build-arg GIT_REPO=https://github.com/your-org/your-repo.git \
-#     --build-arg GIT_REF=main \
+#     --build-arg GIT_REF=master \
 #     -f Dockerfile.git -t stock-app:git .
 #
 # Then run (choose a process by overriding the command):
@@ -31,7 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Build args to configure which repo/ref to clone
 ARG GIT_REPO
-ARG GIT_REF=main
+ARG GIT_REF=master
 
 # Clone the application source into APP_DIR
 RUN test -n "$GIT_REPO" || (echo "GIT_REPO build-arg is required" && exit 1)

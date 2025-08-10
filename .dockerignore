@@ -1,0 +1,47 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+
+# Env files (use Compose env instead of baking secrets)
+.env
+*.env
+stock_pipeline/.env
+
+# VCS / IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Dagster local state (mounted at runtime, not needed in image)
+dagster_home/
+dagster_home/storage/
+dagster_home/.nux/
+.tmp_dagster_home_*/
+
+# Notebooks
+*.ipynb_checkpoints/
+
+# Large/binary assets
+*.pdf
+126F7214*.pdf
+
+# Node (if present)
+node_modules/

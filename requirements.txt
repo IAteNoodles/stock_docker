@@ -4,3 +4,6 @@ requests
 python-dotenv
 psycopg2-binary
 pydantic
+# Orchestration
+dagster
+dagster-webserver
