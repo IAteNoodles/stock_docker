@@ -4,11 +4,8 @@ Endpoints
 - GET /stocks: Ensure data for symbols and date range, then return DB rows.
 - GET /latest: Return latest EOD for a symbol (cache-first, 24h TTL).
 - GET /api-key-history: Show API key index usage and limit timestamps.
-- POST /track, POST /untrack: Manage tracked symbols.
-- GET /track/status, GET /track/list: Tracking utilities.
 
-Startup/shutdown use FastAPI lifespan to initialize schema and run a background
-refresher for tracked symbols.
+Startup/shutdown use FastAPI lifespan to initialize schema.
 """
 
 from typing import Dict, List, Optional
@@ -28,17 +25,12 @@ from .fetch_from_db import (
     list_api_key_history,
     upsert_api_keys_history,
 )
-from .fetch_data import process_tickers, get_or_refresh_latest, fetch_latest_data_marketstack, track_symbol, untrack_symbol, refresh_tracked_symbol, run_tracked_refresher
+from .fetch_data import process_tickers, get_or_refresh_latest
 from .fetch_from_db import (
     connect_to_db,
-    insert_stock_data,
-    update_history_latest_date,
     get_latest_cache,
-    upsert_latest_cache,
-    list_tracked_symbols,
-    list_tracked_symbols_with_meta,
 )
-from .db_schema import create_api_key_history_table, create_latest_table, create_stock_data_table, create_tracked_symbols_table
+from .db_schema import create_api_key_history_table, create_latest_table
 from .config import get_marketstack_api_keys
 from .db_init import init_database
 
@@ -87,7 +79,7 @@ def _get_client_id(request: Request) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown manager to configure logging, init DB, and run worker."""
+    """Startup/shutdown manager to configure logging and init DB (no tracking worker)."""
     # Startup
     setup_app_logging()
     logger.info("[api] logging configured")
@@ -96,35 +88,12 @@ async def lifespan(app: FastAPI):
         logger.info("[api] database init ok=%s", ok)
     except Exception as e:
         logger.error("[api] database init error: %s", e)
-    try:
-        stop_flag_attr = "_tracked_worker_stop_event"
-        if not hasattr(app.state, stop_flag_attr):
-            app.state._tracked_worker_stop_event = threading.Event()
-        t = threading.Thread(
-            target=run_tracked_refresher,
-            kwargs={"stop_event": app.state._tracked_worker_stop_event},
-            daemon=True,
-        )
-        t.start()
-        app.state._tracked_worker_thread = t
-        logger.info("[api] tracked refresher started")
-    except Exception as e:
-        logger.error("[api] failed to start tracked refresher: %s", e)
     # Yield control to the app
     try:
         yield
     finally:
-        # Shutdown
-        try:
-            ev = getattr(app.state, "_tracked_worker_stop_event", None)
-            th = getattr(app.state, "_tracked_worker_thread", None)
-            if ev:
-                ev.set()
-            if th and th.is_alive():
-                th.join(timeout=5)
-                logger.info("[api] tracked refresher stopped")
-        except Exception as e:
-            logger.error("[api] error stopping tracked refresher: %s", e)
+        # No tracking worker to stop anymore
+        pass
 
 
 app = FastAPI(title="Stock Data API", lifespan=lifespan)
@@ -146,6 +115,7 @@ background_executor = ThreadPoolExecutor(max_workers=8)
 _in_progress_refreshes = set()
 _in_progress_lock = threading.Lock()
 
+
 def schedule_refresh(symbol: str):
     sym = symbol.strip().upper()
     if not sym:
@@ -154,12 +124,14 @@ def schedule_refresh(symbol: str):
         if sym in _in_progress_refreshes:
             return
         _in_progress_refreshes.add(sym)
+
     def refresh_task():
         try:
             get_or_refresh_latest(sym)
         finally:
             with _in_progress_lock:
                 _in_progress_refreshes.discard(sym)
+
     background_executor.submit(refresh_task)
 
 
@@ -310,147 +282,6 @@ async def get_api_key_history(request: Request):
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"Error reading api_key_history: {e}")
-    finally:
-        try:
-            await run_in_thread(conn.close)
-        except Exception:
-            pass
-
-
-@app.post("/track")
-async def track(request: Request, symbol: str = Query(..., description="Symbol to start tracking")):
-    """Add a symbol to the tracked list and optionally refresh immediately."""
-    t0 = time.time()
-    cid = _get_client_id(request)
-    logger.info("[api] POST /track start cid=%s symbol=%s", cid, symbol)
-    sym = symbol.strip().upper()
-    if not sym:
-        raise HTTPException(status_code=400, detail="Invalid symbol")
-    ok = await run_in_thread(track_symbol, sym)
-    if not ok:
-        raise HTTPException(status_code=500, detail="Failed to track symbol")
-    schedule_refresh(sym)
-    logger.info("[api] POST /track scheduled background refresh for %s", sym)
-    return {"symbol": sym, "tracked": True}
-
-
-@app.post("/untrack")
-async def untrack(request: Request, symbol: str = Query(..., description="Symbol to stop tracking")):
-    """Remove a symbol from the tracked list (idempotent)."""
-    t0 = time.time()
-    cid = _get_client_id(request)
-    logger.info("[api] POST /untrack start cid=%s symbol=%s", cid, symbol)
-    sym = symbol.strip().upper()
-    if not sym:
-        raise HTTPException(status_code=400, detail="Invalid symbol")
-    conn = await run_in_thread(connect_to_db)
-    current = False
-    if conn:
-        try:
-            def check_tracked():
-                with conn.cursor() as cursor:
-                    create_tracked_symbols_table(cursor)
-                    return sym in list_tracked_symbols(cursor)
-                conn.commit()
-            current = await run_in_thread(check_tracked)
-        except Exception:
-            try:
-                await run_in_thread(conn.rollback)
-            except Exception:
-                pass
-        finally:
-            try:
-                await run_in_thread(conn.close)
-            except Exception:
-                pass
-    removed = await run_in_thread(untrack_symbol, sym)
-    logger.info("[api] POST /untrack end cid=%s symbol=%s removed=%s was_tracked=%s duration=%.3fs", cid, sym, bool(removed), bool(current), (time.time()-t0))
-    if not removed and not current:
-        return {"symbol": sym, "tracked": False, "removed": False}
-    return {"symbol": sym, "tracked": False, "removed": bool(removed)}
-
-
-@app.get("/track/status")
-async def track_status(request: Request, symbol: str = Query(..., description="Tracked symbol to check/refresh")):
-    """Show last_fetched and whether cooldown/cached state applies for a symbol."""
-    t0 = time.time()
-    cid = _get_client_id(request)
-    logger.info("[api] GET /track/status start cid=%s symbol=%s", cid, symbol)
-    sym = symbol.strip().upper()
-    if not sym:
-        raise HTTPException(status_code=400, detail="Invalid symbol")
-    conn = await run_in_thread(connect_to_db)
-    cached = False
-    data = None
-    if conn:
-        try:
-            def get_status():
-                with conn.cursor() as cursor:
-                    create_tracked_symbols_table(cursor)
-                    row = next((r for r in list_tracked_symbols_with_meta(cursor) if r["symbol"] == sym), None)
-                    if row:
-                        d = row.get("last_fetched")
-                        if d is not None and getattr(d, "tzinfo", None) is None:
-                            d = d.replace(tzinfo=timezone.utc)
-                        now_utc = datetime.now(timezone.utc)
-                        delta = 86400 - (now_utc - d).total_seconds() if d else 0
-                        return d, delta > 0
-                conn.commit()
-                return None, False
-            data, cached = await run_in_thread(get_status)
-        except Exception:
-            try:
-                await run_in_thread(conn.rollback)
-            except Exception:
-                pass
-        finally:
-            try:
-                await run_in_thread(conn.close)
-            except Exception:
-                pass
-    logger.info("[api] GET /track/status end cid=%s symbol=%s cached_or_cooldown=%s duration=%.3fs", cid, sym, cached, (time.time()-t0))
-    return {"symbol": sym, "data": data, "cached_or_cooldown": cached}
-
-
-@app.get("/track/list")
-async def track_list(request: Request):
-    """List all tracked symbols with last_fetched and next due time in seconds."""
-    t0 = time.time()
-    logger.info("[api] GET /track/list start cid=%s", request.headers.get("X-Client-Id") or (getattr(request.client, 'host', None) or 'unknown'))
-    conn = await run_in_thread(connect_to_db)
-    if not conn:
-        logger.info("[api] GET /track/list no-db duration=%.3fs", (time.time()-t0))
-        return {"tracked": []}
-    try:
-        def get_list():
-            with conn.cursor() as cursor:
-                create_tracked_symbols_table(cursor)
-                rows = list_tracked_symbols_with_meta(cursor)
-            conn.commit()
-            out = []
-            now_utc = datetime.now(timezone.utc)
-            for r in rows:
-                lf = r.get("last_fetched")
-                if lf is not None and getattr(lf, "tzinfo", None) is None:
-                    lf = lf.replace(tzinfo=timezone.utc)
-                if lf is None:
-                    next_due = "now"
-                    seconds = 0
-                else:
-                    delta = 86400 - (now_utc - lf).total_seconds()
-                    seconds = int(delta) if delta > 0 else 0
-                    next_due = seconds
-                out.append({"symbol": r["symbol"], "last_fetched": r.get("last_fetched"), "seconds_until_next_fetch": next_due})
-            return out
-        out = await run_in_thread(get_list)
-        logger.info("[api] GET /track/list end cid=%s duration=%.3fs count=%d", request.headers.get("X-Client-Id") or (getattr(request.client, 'host', None) or 'unknown'), (time.time()-t0), len(out))
-        return {"tracked": out}
-    except Exception as e:
-        try:
-            await run_in_thread(conn.rollback)
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=f"Error listing tracked symbols: {e}")
     finally:
         try:
             await run_in_thread(conn.close)

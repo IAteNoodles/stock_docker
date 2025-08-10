@@ -18,7 +18,8 @@ from typing import Optional, List
 from dotenv import load_dotenv
 
 # Load .env next to this file so it works regardless of CWD
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+# Do not override pre-set environment variables (e.g., from Docker Compose)
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=False)
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -97,4 +98,5 @@ def get_marketstack_api_keys() -> List[str]:
             keys = [single]
         elif single not in keys:
             keys.insert(0, single)
+    print(f"[config] loaded {len(keys)} Marketstack API keys: {keys}")
     return keys

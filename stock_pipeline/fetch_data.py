@@ -179,7 +179,7 @@ def fetch_historical_data_marketstack(tickers, start_date, end_date):
         logger.warning("MARKETSTACK_API_KEY(S) not found. Proceeding with dummy key for test/mocked runs.")
         keys = [""]
 
-    base_url = "http://api.marketstack.com/v2/eod"
+    base_url = "https://api.marketstack.com/v2/eod"
     all_data = {}
 
     for ticker in tickers:
@@ -289,7 +289,7 @@ def fetch_latest_data_marketstack(tickers):
         logger.warning("MARKETSTACK_API_KEY(S) not found. Proceeding with dummy key for test/mocked runs.")
         keys = [""]
 
-    base_url = "http://api.marketstack.com/v2/eod/latest"
+    base_url = "https://api.marketstack.com/v2/eod/latest"
     all_latest = {}
 
     for ticker in tickers:
@@ -335,7 +335,11 @@ def fetch_latest_data_marketstack(tickers):
         except Exception:
             status = 200
         if status >= 400:
-            logger.error("[api-latest] HTTP %s ticker=%s", status, ticker)
+            try:
+                body = resp.text
+            except Exception:
+                body = "<no body>"
+            logger.error("[api-latest] HTTP %s ticker=%s body=%s", status, ticker, body)
             all_latest[ticker] = None
             continue
         try:
