@@ -22,8 +22,12 @@ services:
       args:
         GIT_REPO: ${GIT_REPO}
         GIT_REF: ${GIT_REF:-main}
-    entrypoint: ["/bin/sh","-lc"]
-    command: ["pip install --no-cache-dir dagster dagster-webserver && exec python -m dagster dev -m dagster_pipeline -d /usr/src/app -h 0.0.0.0 -p 3000"]
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      [
+        "pip install --no-cache-dir dagster dagster-webserver && exec python -m dagster dev -m dagster_pipeline -d /usr/src/app -h 0.0.0.0 -p 3000",
+      ]
+    working_dir: /usr/src/app
     ports:
       - "33000:3000"
     env_file:
@@ -32,8 +36,11 @@ services:
       - DAGSTER_HOME=/usr/src/app/dagster_home
       - DB_HOST=postgres
       - DB_PORT=5432
+      - PYTHONPATH=/usr/src/app
     volumes:
-      - ./stock_pipeline/tracklist.py:/usr/src/app/stock_pipeline/tracklist.py:ro
+      - ./stock_pipeline:/usr/src/app/stock_pipeline:ro
+      # If this repo has dagster_pipeline locally, uncomment the next line:
+      # - ./dagster_pipeline:/usr/src/app/dagster_pipeline:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -45,7 +52,18 @@ services:
       args:
         GIT_REPO: ${GIT_REPO}
         GIT_REF: ${GIT_REF:-main}
-    command: ["uvicorn","stock_pipeline.api:app","--host","0.0.0.0","--port","8000","--workers","2"]
+    command:
+      [
+        "uvicorn",
+        "stock_pipeline.api:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--workers",
+        "2",
+      ]
+    working_dir: /usr/src/app
     ports:
       - "8000:8000"
     env_file:
@@ -53,8 +71,9 @@ services:
     environment:
       - DB_HOST=postgres
       - DB_PORT=5432
+      - PYTHONPATH=/usr/src/app
     volumes:
-      - ./stock_pipeline/tracklist.py:/usr/src/app/stock_pipeline/tracklist.py:ro
+      - ./stock_pipeline:/usr/src/app/stock_pipeline:ro
     depends_on:
       postgres:
         condition: service_healthy
