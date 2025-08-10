@@ -249,9 +249,20 @@ async def get_latest(
         if age_sec < 86400:
             logger.info("[api] GET /latest cache-hit cid=%s symbol=%s age=%.1fs duration=%.3fs", cid, sym, age_sec, (time.time()-t0))
             return {"symbol": sym, "data": cache, "cached": True}
-    schedule_refresh(sym)
-    logger.info("[api] GET /latest scheduled background refresh for %s", sym)
-    return {"symbol": sym, "data": cache, "cached": bool(cache)}
+
+    # If we reach here, cache is missing or stale: fetch synchronously
+    try:
+        data = await run_in_thread(get_or_refresh_latest, sym)
+        if data is not None:
+            logger.info("[api] GET /latest fetched-now cid=%s symbol=%s duration=%.3fs", cid, sym, (time.time()-t0))
+            return {"symbol": sym, "data": data, "cached": False}
+        else:
+            logger.info("[api] GET /latest no-data-after-fetch cid=%s symbol=%s duration=%.3fs", cid, sym, (time.time()-t0))
+            return {"symbol": sym, "data": cache, "cached": bool(cache)}
+    except Exception as e:
+        logger.exception("[api] GET /latest error cid=%s symbol=%s err=%s", cid, sym, e)
+        # Fall back to any cache we had
+        return {"symbol": sym, "data": cache, "cached": bool(cache)}
 
 
 @app.get("/api-key-history")

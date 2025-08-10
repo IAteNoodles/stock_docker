@@ -5,4 +5,4 @@ A change to this file will trigger the Dagster sensor to run the asset automatic
 """
 
 # Example symbols
-track = ["AMZN"]
+track = ["AMZN", "NVDA"]
