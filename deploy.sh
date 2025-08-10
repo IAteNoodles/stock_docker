@@ -1,25 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Simple manager to clone, configure, and run the deploy stack.
-# Usage:
-#   ./deploy.sh                 # interactive wizard
-#   ./deploy.sh deploy          # non-interactive: init defaults, up all, show logs
-#   ./deploy.sh up [services]   # build and start selected services (e.g. 'up api', 'up dagster-webserver')
-#   ./deploy.sh down            # stop services
-#   ./deploy.sh restart         # restart services
-#   ./deploy.sh logs [svc]      # tail logs (optionally service)
-#   ./deploy.sh ps              # show status
-#   ./deploy.sh init            # prompt and (re)write .env.deploy
-#   ./deploy.sh clone <url> [dir] [ref]   # clone a repo (default ref=main)
-#
-# Notes:
-# - Expects docker-compose.deploy.yml in the working directory.
-# - Writes .env.deploy with DB and provider settings, plus GIT_REPO/GIT_REF for build.
-# - Safe to run from fish: this script uses its own bash shebang.
-
-COMPOSE_FILE="docker-compose.deploy.yml"
-ENV_FILE=".env.deploy"
+# Resolve paths relative to this script so it works no matter where it's invoked from
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+COMPOSE_FILE="$SCRIPT_DIR/docker-compose.deploy.yml"
+ENV_FILE="$SCRIPT_DIR/.env.deploy"
 
 require_compose() {
   if ! command -v docker &>/dev/null; then
@@ -34,15 +19,93 @@ require_compose() {
 
 ensure_compose_file() {
   if [[ ! -f "$COMPOSE_FILE" ]]; then
-    echo "Error: $COMPOSE_FILE not found in $(pwd)." >&2
-    echo "Tip: run './deploy.sh clone <repo-url> [dir] [ref]' first, or cd into the repo root." >&2
+    echo "Error: compose file not found: $COMPOSE_FILE" >&2
+    echo "Tip: ensure you're using the repo that contains docker-compose.deploy.yml" >&2
     exit 1
   fi
 }
 
+# Load variables from .env.deploy if present
+load_env() {
+  if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    set -a
+    . "$ENV_FILE"
+    set +a
+  fi
+}
+
+# Wait for Postgres service to be ready
+_db_wait_ready() {
+  docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T postgres sh -lc '
+    set -e
+    U="${POSTGRES_USER:-postgres}"
+    until pg_isready -h 127.0.0.1 -p 5432 -q -U "$U" -d postgres; do
+      sleep 1
+    done
+  ' >/dev/null 2>&1 || true
+}
+
+# Create the target database if it does not exist
+_db_create_if_missing() {
+  local db_name="$1"
+  if [[ -z "${db_name}" ]]; then
+    echo "[deploy] DB_NAME is empty; cannot create database" >&2
+    return 1
+  fi
+  docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T -e DBNAME="$db_name" postgres sh -s <<'SH'
+set -e
+U="${POSTGRES_USER:-postgres}"
+EXISTS="$(psql -U "$U" -d postgres -Atqc "SELECT 1 FROM pg_database WHERE datname='${DBNAME}';")"
+if [ "$EXISTS" != "1" ]; then
+  echo "[deploy] creating database ${DBNAME}"
+  psql -U "$U" -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"${DBNAME}\";"
+else
+  echo "[deploy] database ${DBNAME} already exists"
+fi
+SH
+}
+
+# Apply minimal schema required by the app (idempotent)
+_db_apply_schema() {
+  local db_name="$1"
+  docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T -e DBNAME="$db_name" postgres sh -s <<'SH'
+set -e
+U="${POSTGRES_USER:-postgres}"
+# Create tables if they do not exist
+psql -U "$U" -d "${DBNAME}" -v ON_ERROR_STOP=1 <<SQL
+CREATE TABLE IF NOT EXISTS history (
+  symbol TEXT PRIMARY KEY,
+  latest_data_date DATE
+);
+
+CREATE TABLE IF NOT EXISTS latest (
+  symbol TEXT PRIMARY KEY,
+  data JSONB NOT NULL,
+  last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+SQL
+SH
+}
+
+# Ensure the configured database exists inside the Postgres service
+ensure_db_exists() {
+  load_env
+  local db_name="${DB_NAME:-}"
+  if [[ -z "$db_name" ]]; then
+    echo "[deploy] Warning: DB_NAME not set in $ENV_FILE; skipping DB creation" >&2
+    return 0
+  fi
+  _db_wait_ready
+  _db_create_if_missing "$db_name" || true
+  _db_apply_schema "$db_name" || true
+}
+
 prompt_var() {
-  local var_name="$1"; shift
-  local prompt="$1"; shift
+  local var_name="$1"
+  shift
+  local prompt="$1"
+  shift
   local default_val="${1-}"
   local val
   if [[ -n "$default_val" ]]; then
@@ -56,59 +119,37 @@ prompt_var() {
 
 write_env_file() {
   echo "\nConfiguring $ENV_FILE..."
-  local DB_NAME DB_USER DB_PASS MARKETSTACK_API_KEYS
-  local GIT_REPO GIT_REF
+  local DB_NAME DB_USER DB_PASS MARKETSTACK_API_KEYS GIT_REPO GIT_REF
   DB_NAME=$(prompt_var DB_NAME "Postgres DB name" "stocks_db")
   DB_USER=$(prompt_var DB_USER "Postgres DB user" "stock_user")
   DB_PASS=$(prompt_var DB_PASS "Postgres DB password" "stock_pass")
   MARKETSTACK_API_KEYS=$(prompt_var MARKETSTACK_API_KEYS "Marketstack API keys (comma-separated)" "")
-  # Set repo defaults without prompting, as requested
-  GIT_REPO="https://github.com/IAteNoodles/stock_docker.git"
-  GIT_REF="master"
+  GIT_REPO=$(prompt_var GIT_REPO "App Git repo (URL, used by Dockerfile.git)" "")
+  GIT_REF=$(prompt_var GIT_REF "App Git ref (branch/tag/commit)" "main")
+  cat >"$ENV_FILE" <<EOF
 
-  cat > "$ENV_FILE" <<EOF
 # Generated by deploy.sh on $(date)
+
 DB_NAME=$DB_NAME
+
 DB_USER=$DB_USER
+
 DB_PASS=$DB_PASS
 
+
 # Comma-separated API keys for Marketstack
+
 MARKETSTACK_API_KEYS=$MARKETSTACK_API_KEYS
 
+
 # Repo and ref for the application cloned during image build
+
 GIT_REPO=$GIT_REPO
+
 GIT_REF=$GIT_REF
+
 EOF
   echo "Wrote $ENV_FILE"
-}
-
-ensure_env_defaults() {
-  # Create a default .env.deploy without prompts if it doesn't exist.
-  if [[ -f "$ENV_FILE" ]]; then
-    return 0
-  fi
-  echo "No $ENV_FILE found. Writing defaults..."
-  local DB_NAME DB_USER DB_PASS MARKETSTACK_API_KEYS GIT_REPO GIT_REF
-  DB_NAME=${DB_NAME:-stocks_db}
-  DB_USER=${DB_USER:-stock_user}
-  DB_PASS=${DB_PASS:-stock_pass}
-  MARKETSTACK_API_KEYS=${MARKETSTACK_API_KEYS:-}
-  GIT_REPO=${GIT_REPO:-https://github.com/IAteNoodles/stock_docker.git}
-  GIT_REF=${GIT_REF:-master}
-  cat > "$ENV_FILE" <<EOF
-# Generated by deploy.sh (defaults) on $(date)
-DB_NAME=$DB_NAME
-DB_USER=$DB_USER
-DB_PASS=$DB_PASS
-
-# Comma-separated API keys for Marketstack
-MARKETSTACK_API_KEYS=$MARKETSTACK_API_KEYS
-
-# Repo and ref for the application cloned during image build
-GIT_REPO=$GIT_REPO
-GIT_REF=$GIT_REF
-EOF
-  echo "Wrote $ENV_FILE (defaults). Update with './deploy.sh init' if needed."
 }
 
 cmd_clone() {
@@ -136,26 +177,14 @@ cmd_init() {
   if [[ -f "$ENV_FILE" ]]; then
     read -r -p "$ENV_FILE exists. Overwrite? [y/N]: " ans || true
     case "${ans,,}" in
-      y|yes) : ;;
-      *) echo "Keeping existing $ENV_FILE"; return 0;;
+    y | yes) : ;;
+    *)
+      echo "Keeping existing $ENV_FILE"
+      return 0
+      ;;
     esac
   fi
   write_env_file
-}
-
-select_services_prompt() {
-  echo "Which services do you want to start?"
-  echo "1) dagster-webserver"
-  echo "2) api"
-  echo "3) both (api & dagster-webserver)"
-  echo "4) all (postgres, api, dagster-webserver)"
-  read -r -p "Select option [1-4]: " choice || true
-  case "${choice}" in
-    1) echo "dagster-webserver" ;;
-    2) echo "api" ;;
-    3) echo "api dagster-webserver" ;;
-    4|*) echo "all" ;;
-  esac
 }
 
 cmd_up() {
@@ -164,82 +193,60 @@ cmd_up() {
     echo "$ENV_FILE not found. Running init..."
     write_env_file
   fi
-
-  # Determine services to start: from args or interactive prompt
-  local services=("${@:-}")
-  if [[ ${#services[@]} -eq 0 ]]; then
-    sel=$(select_services_prompt)
-    if [[ "$sel" != "all" ]]; then
-      # shellcheck disable=SC2206
-      services=($sel)
-    else
-      services=()
-    fi
-  fi
-
   echo "Bringing up stack..."
-  if [[ ${#services[@]} -gt 0 ]]; then
-    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --build "${services[@]}"
+  local NO_CACHE_FLAG="${1-}"
+  if [[ "$NO_CACHE_FLAG" == "--no-cache" ]]; then
+    # Build without cache, then start
+    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" build --no-cache
+    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
   else
-    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --build
+    # Normal path: build (using cache) during up
+    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build
   fi
+  # Ensure application database exists
+  ensure_db_exists
   echo "Services started. Dagster UI: http://localhost:33000  API: http://localhost:8000  Postgres: localhost:65432"
-
-  # Decide which logs to show
-  local log_svcs
-  if [[ ${#services[@]} -eq 0 ]]; then
-    # 'all' chosen; show primary app services
-    log_svcs=(dagster-webserver api)
-  else
-    log_svcs=("${services[@]}")
-  fi
-  echo "Tailing logs for: ${log_svcs[*]} (Ctrl+C to stop)"
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" logs -f --tail=200 "${log_svcs[@]}"
-}
-
-cmd_deploy() {
-  # One-shot: write defaults if needed, up all services, show logs for app services
-  ensure_compose_file
-  ensure_env_defaults
-  echo "Deploying all services..."
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --build
-  echo "Services started. Dagster UI: http://localhost:33000  API: http://localhost:8000  Postgres: localhost:65432"
-  echo "Tailing logs for dagster-webserver and api (Ctrl+C to stop)"
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" logs -f --tail=200 dagster-webserver api
 }
 
 cmd_down() {
   ensure_compose_file
   echo "Stopping services..."
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" down
+  docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down
 }
 
 cmd_restart() {
   ensure_compose_file
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" down
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --build
+  local NO_CACHE_FLAG="${1-}"
+  docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down
+  if [[ "$NO_CACHE_FLAG" == "--no-cache" ]]; then
+    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" build --no-cache
+    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
+  else
+    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build
+  fi
+  ensure_db_exists
 }
 
 cmd_logs() {
   ensure_compose_file
   local svc="${1-}"
   if [[ -n "$svc" ]]; then
-    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" logs -f --tail=200 "$svc"
+    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" logs -f --tail=200 "$svc"
   else
-    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" logs -f --tail=200
+    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" logs -f --tail=200
   fi
 }
 
 cmd_ps() {
   ensure_compose_file
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps
+  docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps
 }
 
 interactive() {
   echo "Deploy wizard"
   echo "1) Clone repo"
   echo "2) Init (.env.deploy)"
-  echo "3) Up (select services and show logs)"
+  echo "3) Up"
   echo "4) Down"
   echo "5) Logs"
   echo "6) Status"
@@ -248,15 +255,38 @@ interactive() {
   while true; do
     read -r -p "Select option: " choice || true
     case "$choice" in
-      1) read -r -p "Repo URL: " u; read -r -p "Directory (blank=auto): " d; read -r -p "Ref [main]: " r; r=${r:-main}; cmd_clone "$u" "$d" "$r";;
-      2) cmd_init ;;
-      3) cmd_up ;;
-      4) cmd_down ;;
-      5) read -r -p "Service (blank=all): " s; cmd_logs "$s" ;;
-      6) cmd_ps ;;
-      7) cmd_restart ;;
-      0) exit 0 ;;
-      *) echo "Unknown option" ;;
+    1)
+      read -r -p "Repo URL: " u
+      read -r -p "Directory (blank=auto): " d
+      read -r -p "Ref [main]: " r
+      r=${r:-main}
+      cmd_clone "$u" "$d" "$r"
+      ;;
+    2) cmd_init ;;
+    3)
+      read -r -p "Rebuild without cache? [y/N]: " nc || true
+      if [[ "${nc,,}" == "y" || "${nc,,}" == "yes" ]]; then
+        cmd_up --no-cache
+      else
+        cmd_up
+      fi
+      ;;
+    4) cmd_down ;;
+    5)
+      read -r -p "Service (blank=all): " s
+      cmd_logs "$s"
+      ;;
+    6) cmd_ps ;;
+    7)
+      read -r -p "Rebuild without cache? [y/N]: " nc || true
+      if [[ "${nc,,}" == "y" || "${nc,,}" == "yes" ]]; then
+        cmd_restart --no-cache
+      else
+        cmd_restart
+      fi
+      ;;
+    0) exit 0 ;;
+    *) echo "Unknown option" ;;
     esac
   done
 }
@@ -265,16 +295,31 @@ main() {
   require_compose
   local cmd="${1-}"
   case "$cmd" in
-    deploy) cmd_deploy ;;
-    clone) shift; cmd_clone "$@" ;;
-    init) cmd_init ;;
-    up) shift || true; cmd_up "$@" ;;
-    down) cmd_down ;;
-    restart) cmd_restart ;;
-    logs) shift || true; cmd_logs "${1-}" ;;
-    ps|status) cmd_ps ;;
-    "") interactive ;;
-    *) echo "Unknown command: $cmd"; echo "See header for usage."; exit 1 ;;
+  clone)
+    shift
+    cmd_clone "$@"
+    ;;
+  init) cmd_init ;;
+  up)
+    shift || true
+    cmd_up "$@"
+    ;;
+  down) cmd_down ;;
+  restart)
+    shift || true
+    cmd_restart "$@"
+    ;;
+  logs)
+    shift || true
+    cmd_logs "${1-}"
+    ;;
+  ps | status) cmd_ps ;;
+  "") interactive ;;
+  *)
+    echo "Unknown command: $cmd"
+    echo "See header for usage."
+    exit 1
+    ;;
   esac
 }
 
