@@ -22,15 +22,18 @@ services:
       args:
         GIT_REPO: ${GIT_REPO}
         GIT_REF: ${GIT_REF:-main}
-    command: ["python","-m","dagster","dev","-m","dagster_pipeline","-d","/usr/src/app","-h","0.0.0.0","-p","3000"]
+    entrypoint: ["/bin/sh","-lc"]
+    command: ["pip install --no-cache-dir dagster dagster-webserver && exec python -m dagster dev -m dagster_pipeline -d /usr/src/app -h 0.0.0.0 -p 3000"]
     ports:
-      - "3000:3000"
+      - "33000:3000"
     env_file:
       - .env.deploy
     environment:
       - DAGSTER_HOME=/usr/src/app/dagster_home
       - DB_HOST=postgres
       - DB_PORT=5432
+    volumes:
+      - ./stock_pipeline/tracklist.py:/usr/src/app/stock_pipeline/tracklist.py:ro
     depends_on:
       postgres:
         condition: service_healthy
