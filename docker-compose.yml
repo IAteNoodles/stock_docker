@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      - POSTGRES_DB=${DB_NAME}
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASS}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+
+  dagster-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["dagster","dev","-m","dagster_pipeline","-d","/usr/src/app","-h","0.0.0.0","-p","3000"]
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      - DAGSTER_HOME=/usr/src/app/dagster_home
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASS=${DB_PASS}
+      - MARKETSTACK_API_KEYS=${MARKETSTACK_API_KEYS}
+    volumes:
+      - .:/usr/src/app
+    depends_on:
+      - postgres
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn","stock_pipeline.api:app","--host","0.0.0.0","--port","8000","--workers","2"]
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASS=${DB_PASS}
+      - MARKETSTACK_API_KEYS=${MARKETSTACK_API_KEYS}
+    volumes:
+      - .:/usr/src/app
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
