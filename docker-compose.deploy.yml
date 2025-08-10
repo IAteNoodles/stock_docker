@@ -53,6 +53,8 @@ services:
     environment:
       - DB_HOST=postgres
       - DB_PORT=5432
+    volumes:
+      - ./stock_pipeline/tracklist.py:/usr/src/app/stock_pipeline/tracklist.py:ro
     depends_on:
       postgres:
         condition: service_healthy
