@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      - POSTGRES_DB=${DB_NAME}
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASS}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+
+  dagster-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.git
+      args:
+        GIT_REPO: ${GIT_REPO}
+        GIT_REF: ${GIT_REF:-main}
+    command: ["dagster","dev","-m","dagster_pipeline","-d","/usr/src/app","-h","0.0.0.0","-p","3000"]
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      - DAGSTER_HOME=/usr/src/app/dagster_home
+      - DB_HOST=postgres
+      - DB_PORT=5432
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.git
+      args:
+        GIT_REPO: ${GIT_REPO}
+        GIT_REF: ${GIT_REF:-main}
+    command: ["uvicorn","stock_pipeline.api:app","--host","0.0.0.0","--port","8000","--workers","2"]
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

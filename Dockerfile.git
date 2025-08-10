@@ -1,0 +1,67 @@
+# Build an image by cloning the app from a Git repository
+# Usage (fish):
+#   docker build \
+#     --build-arg GIT_REPO=https://github.com/your-org/your-repo.git \
+#     --build-arg GIT_REF=main \
+#     -f Dockerfile.git -t stock-app:git .
+#
+# Then run (choose a process by overriding the command):
+#   docker run --env-file .env -p 8000:8000 stock-app:git \
+#     uvicorn stock_pipeline.api:app --host 0.0.0.0 --port 8000
+# or
+#   docker run --env-file .env -p 3000:3000 stock-app:git \
+#     dagster dev -m dagster_pipeline -d /usr/src/app -h 0.0.0.0 -p 3000
+
+FROM python:3.11-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PATH="/root/.local/bin:${PATH}" \
+    APP_DIR=/usr/src/app \
+    DAGSTER_HOME=/usr/src/app/dagster_home
+
+WORKDIR /tmp/build
+
+# OS deps (git + build essentials)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git build-essential ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-ca-certificates
+
+# Build args to configure which repo/ref to clone
+ARG GIT_REPO
+ARG GIT_REF=main
+
+# Clone the application source into APP_DIR
+RUN test -n "$GIT_REPO" || (echo "GIT_REPO build-arg is required" && exit 1)
+RUN git clone --depth=1 --branch "$GIT_REF" "$GIT_REPO" "$APP_DIR"
+
+WORKDIR $APP_DIR
+
+# Install Python deps from the cloned repo
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    if [ -f requirements.txt ]; then \
+      pip install -r requirements.txt; \
+    elif [ -f pyproject.toml ]; then \
+      pip install .; \
+    else \
+      echo "No requirements.txt or pyproject.toml found; skipping Python deps"; \
+    fi
+
+# Provide defaults for env and tracklist inside the image
+# - .env.example can be copied to .env at runtime on platforms like Kubernetes or Docker
+# - tracklist.py can be overridden at build-time by providing a file in the build context
+#   (COPY below will overwrite the repo's tracklist.py if present)
+COPY .env.example $APP_DIR/.env.example
+RUN mkdir -p $APP_DIR/stock_pipeline
+COPY stock_pipeline/tracklist.py $APP_DIR/stock_pipeline/tracklist.py
+
+# Ensure Dagster home exists (used when running webserver)
+RUN mkdir -p $DAGSTER_HOME
+
+# Expose common ports
+EXPOSE 3000 8000
+
+# Default no-op command; override in `docker run` or Compose
+CMD ["bash", "-lc", "echo 'Provide a command, e.g., uvicorn stock_pipeline.api:app --host 0.0.0.0 --port 8000' && sleep infinity"]
