@@ -1,1 +1,6 @@
 .env
+venv/
+dagster_home/
+__pycache__/
+.pytest_cache/
+.env.deploy

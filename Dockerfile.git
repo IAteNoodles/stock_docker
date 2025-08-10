@@ -47,7 +47,10 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
       pip install .; \
     else \
       echo "No requirements.txt or pyproject.toml found; skipping Python deps"; \
-    fi
+    fi && \
+    # Ensure Dagster CLI is present even if not declared in repo deps
+    pip install --no-cache-dir dagster dagster-webserver && \
+    python -c "import dagster, dagster_webserver; print('dagster ok')"
 
 # Provide defaults for env and tracklist inside the image
 # - .env.example can be copied to .env at runtime on platforms like Kubernetes or Docker
