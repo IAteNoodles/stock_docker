@@ -22,11 +22,11 @@ services:
       args:
         GIT_REPO: ${GIT_REPO}
         GIT_REF: ${GIT_REF:-main}
-    command: ["dagster","dev","-m","dagster_pipeline","-d","/usr/src/app","-h","0.0.0.0","-p","3000"]
+    command: ["python","-m","dagster","dev","-m","dagster_pipeline","-d","/usr/src/app","-h","0.0.0.0","-p","3000"]
     ports:
       - "3000:3000"
     env_file:
-      - .env
+      - .env.deploy
     environment:
       - DAGSTER_HOME=/usr/src/app/dagster_home
       - DB_HOST=postgres
@@ -46,7 +46,7 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - .env
+      - .env.deploy
     environment:
       - DB_HOST=postgres
       - DB_PORT=5432
